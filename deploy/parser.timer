@@ -1,0 +1,11 @@
+[Unit]
+Description=Run lead parser every hour
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1h
+Persistent=true
+Unit=parser.service
+
+[Install]
+WantedBy=timers.target

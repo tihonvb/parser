@@ -1,0 +1,22 @@
+[Unit]
+Description=Durable lead parser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=parser
+Group=parser
+WorkingDirectory=/opt/parser
+ExecStart=/opt/parser/.venv/bin/python /opt/parser/main.py --config /var/lib/parser/config.yaml
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/parser
+# 1 means partial collection or pending work; it remains visible as a failed run.
+SuccessExitStatus=3
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30min
