@@ -19,3 +19,8 @@ seen_leads.json
 # не часть кода.
 vk_candidates.csv
 telegram_candidates.csv
+
+# Токены VK, бэкап конфига и лог cron — локальное состояние/секреты.
+vk_tokens.json
+config.yaml.save
+cron.log
