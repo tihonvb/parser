@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import avito_parser
-from avito_parser import (
+import lead_parser.infrastructure.integrations.avito.collector as avito_parser
+from lead_parser.infrastructure.integrations.avito.collector import (
     SELECTORS,
     BrowserResources,
     SourceError,
@@ -128,7 +128,7 @@ def test_independent_cleanup_after_context_failure(cfg, monkeypatch):
 def test_partial_card_and_cleanup_failure_keep_good_data(cfg, monkeypatch):
     from contextlib import nullcontext
 
-    from storage import Store
+    from lead_parser.infrastructure.persistence.sqlite import Store
 
     cfg["avito"].update(enabled=True, search_queries=["ремонт"])
     good = HTML(Path("fixtures/avito-card.html").read_text())

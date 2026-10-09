@@ -1,14 +1,27 @@
 import json
+import sqlite3
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import requests
 
-from common import Lead, unique_leads
-from delivery import drain
-from sheets_writer import HEADER, SchemaConflict, SheetsWriter, destination
-from storage import StorageError, Store
-from telegram_notify import NotificationError, send_to
+from lead_parser.application.models import DeliveryPlan, DeliveryTarget
+from lead_parser.bootstrap import build_delivery
+from lead_parser.core.policies import unique_leads
+from lead_parser.infrastructure.integrations.google_sheets.gateway import (
+    SchemaConflict,
+    SheetsGateway,
+    SheetsWriter,
+    destination,
+)
+from lead_parser.infrastructure.integrations.google_sheets.schema import HEADER
+from lead_parser.infrastructure.integrations.telegram.notifications import NotificationError, send_to
+from lead_parser.infrastructure.persistence.sqlite import StorageError, Store
+
+
+def drain(cfg, store, **kwargs):
+    return build_delivery(cfg, store, **kwargs).drain()
 
 
 class Worksheet:
@@ -44,7 +57,7 @@ def enable_output(cfg):
 
 
 def test_merge_one_key_rich_metadata(lead):
-    second = Lead.from_dict(lead.to_dict())
+    second = deepcopy(lead)
     second.text += " под ключ"
     second.url = "https://vk.com/wall-12_9"
     second.phone = ""
@@ -166,7 +179,7 @@ def test_conflicting_reserved_row_is_never_overwritten(cfg, lead):
         store.reserve_row(job, 2)
         ws.rows.append(["personal note"])
         with pytest.raises(SchemaConflict):
-            SheetsWriter(cfg, ws).deliver(store, job, lead)
+            SheetsGateway(lambda: SheetsWriter(cfg, ws), store).deliver(lead, job)
         assert ws.rows[1] == ["personal note"]
 
 
@@ -220,3 +233,91 @@ def test_adding_recipient_does_not_replay_historical_leads(cfg, lead):
             sender=lambda *args: calls.append(args[-1]),
         )
         assert calls == ["1", "2"] and len(ws.rows) == 2
+
+
+def test_generic_delivery_plan_is_atomic_and_keeps_first_routing(cfg, lead):
+    plan = DeliveryPlan(DeliveryTarget("crm", "primary"), (DeliveryTarget("email", "operator"),))
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest([lead])
+        store.classification(lead, "accepted")
+        store.db.execute(
+            "CREATE TRIGGER fail_secondary BEFORE INSERT ON deliveries WHEN NEW.kind='email' "
+            "BEGIN SELECT RAISE(ABORT, 'simulated dependent write failure'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.enqueue_plan(plan)
+        assert store.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 0
+        store.db.execute("DROP TRIGGER fail_secondary")
+        store.enqueue_plan(plan)
+        store.enqueue_plan(DeliveryPlan(DeliveryTarget("crm", "other"), (DeliveryTarget("sms", "new"),)))
+        assert {tuple(row) for row in store.db.execute("SELECT kind,destination FROM deliveries")} == {
+            ("crm", "primary"),
+            ("email", "operator"),
+        }
+        assert store.claim("email", ["operator"]) is None
+        primary = store.claim("crm", ["primary"])
+        store.delivered(primary)
+        assert store.claim("email", ["operator"])
+
+
+def test_existing_v1_database_reopens_without_rewriting_payload_or_losing_delivery_reservation(tmp_path):
+    """This fixture is written through SQLite, independently of the current adapter."""
+    path = tmp_path / "pre-layered.sqlite3"
+    payload = json.dumps(
+        {
+            "source": "vk",
+            "external_id": "-12_9",
+            "date": "2026-10-01T10:00:00+00:00",
+            "text": "Нужен ремонт",
+            "source_group_id": "vk:12",
+            "observed_at": "2026-10-01T11:00:00+00:00",
+            "extra": {"ai_is_client": True, "ai_confidence": 0.9, "prompt_version": "client-request-v2"},
+        },
+        ensure_ascii=False,
+    )
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            PRAGMA user_version=1;
+            CREATE TABLE leads (
+              key TEXT PRIMARY KEY, payload TEXT NOT NULL, content_hash TEXT NOT NULL,
+              ai_state TEXT NOT NULL DEFAULT 'pending', ai_attempts INTEGER NOT NULL DEFAULT 0,
+              ai_next_at REAL NOT NULL DEFAULT 0, verdict TEXT, ai_error TEXT,
+              first_seen REAL NOT NULL, last_seen REAL NOT NULL);
+            CREATE TABLE deliveries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, lead_key TEXT NOT NULL REFERENCES leads(key),
+              kind TEXT NOT NULL, destination TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
+              lease_owner TEXT, lease_until REAL, last_error TEXT, sheet_row INTEGER,
+              depends_on INTEGER REFERENCES deliveries(id), created REAL NOT NULL, delivered REAL,
+              UNIQUE(lead_key,kind,destination));
+            CREATE TABLE sources (
+              id TEXT PRIMARY KEY, cursor TEXT NOT NULL DEFAULT '{}', report TEXT NOT NULL DEFAULT '{}',
+              updated REAL NOT NULL);
+        """)
+        db.execute(
+            "INSERT INTO leads(key,payload,content_hash,ai_state,ai_attempts,verdict,first_seen,last_seen) "
+            "VALUES(?,?,?,'accepted',2,?,1,2)",
+            ("vk:-12_9", payload, "existing-hash", '{"ai_is_client":true}'),
+        )
+        db.execute(
+            "INSERT INTO deliveries(id,lead_key,kind,destination,state,attempts,lease_owner,lease_until,sheet_row,created) "
+            "VALUES(71,'vk:-12_9','sheets','test:Лиды','leased',1,'expired-owner',1,17,1)"
+        )
+        db.execute(
+            "INSERT INTO deliveries(id,lead_key,kind,destination,depends_on,created) "
+            "VALUES(72,'vk:-12_9','telegram','operator',71,1)"
+        )
+        db.execute("INSERT INTO sources VALUES('vk:12',?, '{}',1)", ('{"offset":200}',))
+    with Store(path) as store:
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert store.db.execute("SELECT payload FROM leads").fetchone()[0] == payload
+        assert store.db.execute("SELECT ai_attempts FROM leads").fetchone()[0] == 2
+        assert store.pending_ai() == []
+        assert store.lead("vk:-12_9").extra["prompt_version"] == "client-request-v2"
+        assert store.cursor("vk:12") == {"offset": 200}
+        assert store.claim("telegram", ["operator"], now=100) is None
+        resumed = store.claim("sheets", ["test:Лиды"], now=100)
+        assert resumed["id"] == 71 and resumed["sheet_row"] == 17
+        assert store.reserve_row(resumed, 1000) == 17
+        store.delivered(resumed)
+        assert store.claim("telegram", ["operator"], now=100)["id"] == 72

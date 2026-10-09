@@ -5,9 +5,12 @@ from types import SimpleNamespace
 import pytest
 from telethon.errors import FloodWaitError
 
-import telegram_parser
-from storage import Store
-from telegram_parser import _collect_from_channel, collect_leads_async
+import lead_parser.infrastructure.integrations.telegram.collector as telegram_parser
+from lead_parser.infrastructure.integrations.telegram.collector import (
+    _collect_from_channel,
+    collect_leads_async,
+)
+from lead_parser.infrastructure.persistence.sqlite import Store
 
 
 class Client:

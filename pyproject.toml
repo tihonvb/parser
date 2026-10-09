@@ -9,6 +9,19 @@ dependencies = [
   "google-auth>=2.30,<3", "python-dotenv>=1,<2", "filelock>=3.19,<4",
 ]
 
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+lead-parser = "lead_parser.interfaces.cli.entrypoint:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lead_parser"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/lead_parser", "pyproject.toml", "README.md", "LICENSE", "uv.lock"]
+
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
 

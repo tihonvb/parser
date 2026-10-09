@@ -1,8 +1,6 @@
-"""Deprecated refresh alias. YAML is no longer rewritten; main reads the token file."""
+"""Compatibility entry point; implementation lives in lead_parser.interfaces.cli.vk_refresh_and_sync."""
 
-import sys
-
-from vk_token import main as token_main
+from lead_parser.interfaces.cli.vk_refresh_and_sync import main
 
 if __name__ == "__main__":
-    sys.exit(token_main(["refresh", *sys.argv[1:]]))
+    raise SystemExit(main())

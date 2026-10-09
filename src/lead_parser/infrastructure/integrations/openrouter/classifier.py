@@ -8,9 +8,11 @@ import re
 
 import requests
 
-from common import Lead, unique_leads
-from configuration import ConfigError, _filled
-from security import safe_error
+from lead_parser.application.models import ClassifiedLead
+from lead_parser.core.models import ClassificationDecision, ClassificationState, Lead, Verdict
+from lead_parser.core.policies import decide_classification, unique_leads
+from lead_parser.infrastructure.configuration import ConfigError, _filled
+from lead_parser.infrastructure.security import safe_error
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 PROMPT_VERSION = "client-request-v2"
@@ -165,7 +167,11 @@ def filter_leads(cfg: dict, leads: list[Lead]) -> list[Lead]:
                 ai_threshold=settings.get("min_confidence", 0.75),
                 ai_text_truncated=len(lead.text) > settings.get("max_text_chars", 12000),
             )
-            if verdict["is_client"] and verdict["confidence"] >= settings.get("min_confidence", 0.75):
+            decision = decide_classification(
+                Verdict(verdict["is_client"], verdict["confidence"], verdict["reason"]),
+                settings.get("min_confidence", 0.75),
+            )
+            if decision.state is ClassificationState.ACCEPTED:
                 kept.append(lead)
     _sync_metadata(originals, leads)
     return kept
@@ -175,3 +181,30 @@ def _sync_metadata(originals: list[Lead], classified: list[Lead]) -> None:
     metadata = {lead.dedupe_key(): lead.extra for lead in classified}
     for lead in originals:
         lead.extra = dict(metadata[lead.dedupe_key()])
+
+
+class OpenRouterClassifier:
+    """Convert provider metadata into an explicit, provider-independent outcome."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+
+    def classify(self, leads: list[Lead]) -> list[ClassifiedLead]:
+        candidates = unique_leads(leads)
+        filter_leads(self.cfg, candidates)
+        settings = self.cfg.get("ai_filter", {})
+        outcomes = []
+        for lead in candidates:
+            if not settings.get("enabled", False):
+                decision = ClassificationDecision(ClassificationState.ACCEPTED)
+            elif lead.extra.get("ai_pending"):
+                decision = ClassificationDecision(
+                    ClassificationState.PENDING, error=lead.extra.get("ai_error", "ClassificationUnavailable")
+                )
+            else:
+                verdict = Verdict(
+                    lead.extra["ai_is_client"], lead.extra["ai_confidence"], lead.extra["ai_reason"]
+                )
+                decision = decide_classification(verdict, settings.get("min_confidence", 0.75))
+            outcomes.append(ClassifiedLead(lead=lead, decision=decision))
+        return outcomes

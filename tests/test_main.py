@@ -1,16 +1,16 @@
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock, Timeout
 
-import ai_filter
-import delivery
-import main
-from common import Lead, ScanResult
-from sheets_writer import SheetsWriter
-from storage import Store
+import lead_parser.bootstrap as main
+import lead_parser.infrastructure.integrations.openrouter.classifier as ai_filter
+import lead_parser.interfaces.cli.main as cli
+from lead_parser.application.models import ScanResult
+from lead_parser.core.models import Lead
+from lead_parser.infrastructure.integrations.google_sheets.gateway import SheetsWriter
+from lead_parser.infrastructure.persistence.sqlite import Store
 from tests.test_storage_delivery import Worksheet
 
 
@@ -33,9 +33,12 @@ def test_full_pipeline_partial_sources_and_restart_without_reclassification(cfg,
         raise RuntimeError("token should never be printed")
 
     monkeypatch.setattr(
-        main.importlib,
-        "import_module",
-        lambda name: SimpleNamespace(collect_leads=collected if name == "vk_parser" else failed),
+        main,
+        "build_sources",
+        lambda config: (
+            main.ConfiguredSource("telegram", config, failed),
+            main.ConfiguredSource("vk", config, collected),
+        ),
     )
     calls = []
 
@@ -46,10 +49,11 @@ def test_full_pipeline_partial_sources_and_restart_without_reclassification(cfg,
     monkeypatch.setattr(ai_filter, "_classify_batch", classify)
     ws = Worksheet()
     sent = []
+    build_delivery = main.build_delivery
     monkeypatch.setattr(
         main,
-        "drain",
-        lambda config, store: delivery.drain(
+        "build_delivery",
+        lambda config, store: build_delivery(
             config,
             store,
             writer_factory=lambda config: SheetsWriter(config, ws),
@@ -102,7 +106,7 @@ def test_loop_reloads_configuration_and_refreshes_vk_each_cycle(cfg, monkeypatch
         return []
 
     monkeypatch.setattr(
-        main.importlib, "import_module", lambda name: SimpleNamespace(collect_leads=collector)
+        main, "build_sources", lambda config: (main.ConfiguredSource("vk", config, collector),)
     )
 
     def next_cycle(*args):
@@ -114,8 +118,8 @@ def test_loop_reloads_configuration_and_refreshes_vk_each_cycle(cfg, monkeypatch
         else:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(main.time, "sleep", next_cycle)
-    assert main.main(["--config", str(path), "--loop"]) == 0
+    monkeypatch.setattr(cli.time, "sleep", next_cycle)
+    assert cli.main(["--config", str(path), "--loop"]) == 0
     assert seen == [("token-1", "Самара"), ("token-2", "Казань")]
 
 
@@ -125,5 +129,5 @@ def test_status_can_inspect_inbox_without_expired_api_credentials(cfg):
     cfg["ai_filter"].update(enabled=True, openrouter_api_key="")
     path = Path(cfg["_config_path"])
     path.write_text(yaml.safe_dump({key: value for key, value in cfg.items() if not key.startswith("_")}))
-    assert main.main(["--config", str(path), "--status"]) == 0
-    assert main.main(["--config", str(path), "--check-config"]) == 2
+    assert cli.main(["--config", str(path), "--status"]) == 0
+    assert cli.main(["--config", str(path), "--check-config"]) == 2

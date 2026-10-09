@@ -38,6 +38,35 @@ jobs:
       - run: uv run --locked python main.py --config config.example.yaml --check-config
       - run: uv run --locked python evaluate.py --config config.example.yaml --output reports/offline.json
       - run: uv run --locked python scripts/check_secrets.py
+      - name: Build and smoke-test installed wheel outside checkout
+        shell: bash
+        run: |
+          uv build
+          parser_wheel_env="$(mktemp -d)"
+          uv venv "$parser_wheel_env"
+          uv pip install --python "$parser_wheel_env/bin/python" -r requirements.txt
+          uv pip install --python "$parser_wheel_env/bin/python" --no-deps dist/*.whl
+          parser_smoke_dir="$(mktemp -d)"
+          cp config.example.yaml "$parser_smoke_dir/config.yaml"
+          cd "$parser_smoke_dir"
+          "$parser_wheel_env/bin/lead-parser" --check-config
+          "$parser_wheel_env/bin/python" -m lead_parser evaluate --output evaluation.json
+          "$parser_wheel_env/bin/python" - <<'PY'
+          import json
+          import sys
+          from importlib.resources import files
+          from pathlib import Path
+
+          import lead_parser
+
+          report = json.loads(Path("evaluation.json").read_text())
+          assert Path(lead_parser.__file__).is_relative_to(sys.prefix)
+          assert report["dataset_size"] >= 30
+          assert report["prefilter"]["recall"] == 1
+          assert report["pipeline"] is None
+          assert files("lead_parser.resources").joinpath("evaluation.jsonl").is_file()
+          assert not Path(".data").exists()
+          PY
       - name: Verify exported runtime dependencies
         run: |
           uv export --locked --no-dev --no-emit-project --no-header --output-file /tmp/parser-requirements.txt > /dev/null

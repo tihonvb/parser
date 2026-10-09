@@ -2,28 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import gspread
 from google.oauth2.service_account import Credentials
 
-from common import Lead
+from lead_parser.application.errors import DeliveryError
+from lead_parser.application.models import DeliveryJob
+from lead_parser.application.ports import RowReservations
+from lead_parser.core.models import Lead
+from lead_parser.infrastructure.integrations.google_sheets.schema import HEADER, lead_to_row
+from lead_parser.infrastructure.security import delivery_error
 
-LEGACY_HEADER = [
-    "Дата",
-    "Источник",
-    "Группа/канал",
-    "Автор",
-    "Текст",
-    "Телефон",
-    "Цена",
-    "Ссылка",
-    "Вердикт ИИ",
-]
-HEADER = LEGACY_HEADER + ["ID лида", "ID источника", "Обнаружено", "Версия промпта"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
 
 
-class SchemaConflict(RuntimeError):
-    pass
+class SchemaConflict(DeliveryError):
+    def __init__(self, message: str):
+        super().__init__(message, permanent=True)
 
 
 def destination(cfg: dict) -> str:
@@ -66,17 +62,18 @@ class SheetsWriter:
                     raise SchemaConflict("Duplicate lead IDs in sheet; resolve before delivery")
                 self.existing[key] = index
 
-    def deliver(self, store, job: dict, lead: Lead) -> None:
+    def find_existing_row(self, key: str) -> int | None:
+        return self.existing.get(key)
+
+    def write_row(self, lead: Lead, row: int) -> None:
         key = lead.dedupe_key()
-        existing = self.existing.get(key)
-        row = store.reserve_row(job, self.minimum_row, existing_row=existing)
         current = self.ws.get(f"A{row}:M{row}")
         current = current[0] if current else []
         if any(current) and (len(current) < 10 or current[9] != key):
             raise SchemaConflict("Reserved row contains another record; restore sheet order before retry")
         if row > self.ws.row_count:
             self.ws.add_rows(row - self.ws.row_count)
-        values = lead.as_row()
+        values = lead_to_row(lead)
         # Sheets limits cells to 50,000 characters; the complete original remains in SQLite.
         values[4] = values[4][:49950] + ("\n[Полный текст в SQLite]" if len(values[4]) > 49950 else "")
         self.ws.update(values=[values], range_name=f"A{row}:M{row}", value_input_option="RAW")
@@ -84,15 +81,25 @@ class SheetsWriter:
         self.minimum_row = max(self.minimum_row, row + 1)
 
 
-def append_leads(cfg: dict, leads) -> int:
-    """Compatibility entry point using the same durable outbox as main."""
-    from delivery import drain
-    from storage import Store
+class SheetsGateway:
+    """Deliver through a reserved, restart-stable row without knowing SQLite."""
 
-    with Store(cfg["storage"]["database"]) as store:
-        leads = list(leads)
-        store.ingest(leads)
-        for lead in leads:
-            store.classification(lead, "accepted")
-            store.enqueue(lead.dedupe_key(), destination(cfg), [])
-        return drain(cfg, store).get("sheets", 0)
+    def __init__(self, writer_factory: Callable[[], SheetsWriter], reservations: RowReservations):
+        self.writer_factory = writer_factory
+        self.reservations = reservations
+        self.writer: SheetsWriter | None = None
+
+    def deliver(self, lead: Lead, job: DeliveryJob) -> None:
+        try:
+            if self.writer is None:
+                self.writer = self.writer_factory()
+            row = self.reservations.reserve_row(
+                job,
+                self.writer.minimum_row,
+                existing_row=self.writer.find_existing_row(lead.dedupe_key()),
+            )
+            self.writer.write_row(lead, row)
+        except DeliveryError:
+            raise
+        except Exception as error:
+            raise delivery_error(error) from error

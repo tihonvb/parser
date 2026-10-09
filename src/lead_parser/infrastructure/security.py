@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
+
+from lead_parser.application.errors import DeliveryError
 
 
 def private_write(path: str | Path, content: str) -> None:
@@ -39,3 +42,14 @@ def safe_error(error: BaseException) -> str:
     response = getattr(error, "response", None)
     status = getattr(response, "status_code", None)
     return type(error).__name__ + (f" (HTTP {status})" if isinstance(status, int) else "")
+
+
+def delivery_error(error: Exception) -> DeliveryError:
+    """Translate SDK/HTTP failures once, without leaking their response bodies."""
+    if isinstance(error, DeliveryError):
+        return error
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    retry_after = getattr(error, "retry_after", 0)
+    if type(retry_after) not in {int, float} or not math.isfinite(retry_after) or retry_after < 0:
+        retry_after = 0
+    return DeliveryError(safe_error(error), permanent=status in {400, 401, 403, 404}, retry_after=retry_after)

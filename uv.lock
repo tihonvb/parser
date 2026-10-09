@@ -537,7 +537,7 @@ wheels = [
 [[package]]
 name = "remont-lead-parser"
 version = "0.2.0.dev0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "filelock" },
     { name = "google-auth" },

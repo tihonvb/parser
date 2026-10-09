@@ -9,9 +9,12 @@ from datetime import UTC, datetime
 
 import requests
 
-from common import Lead, ScanResult, extract_phone, keyword_decision, matches_keywords
-from security import safe_error
-from vk_client import VKClient, VKError
+from lead_parser.application.models import ScanResult
+from lead_parser.application.ports import CollectionState
+from lead_parser.core.models import Lead
+from lead_parser.core.policies import extract_phone, keyword_decision, matches_keywords
+from lead_parser.infrastructure.integrations.vk.client import VKClient, VKError
+from lead_parser.infrastructure.security import safe_error
 
 EXECUTE_BATCH_SIZE = 25
 _LINK_RE = re.compile(r"^(?:https?://)?(?:m\.)?vk\.(?:com|ru)/", re.I)
@@ -117,7 +120,7 @@ def _run_batched(client, tasks):
     ]
 
 
-def _scan_group(client, gid, names, cfg, store, reports, source_ref=""):
+def _scan_group(client, gid, names, cfg, store: CollectionState | None, reports, source_ref=""):
     settings = cfg["vk"]
     result = ScanResult(f"vk:{gid}")
     previous = store.cursor(result.source_id) if store else {}
@@ -235,7 +238,9 @@ def _scan_group(client, gid, names, cfg, store, reports, source_ref=""):
     return leads
 
 
-def collect_leads(cfg, store=None, reports=None, client=None):
+def collect_leads(
+    cfg: dict, store: CollectionState | None = None, reports: list[ScanResult] | None = None, client=None
+) -> list[Lead]:
     reports = reports if reports is not None else []
     settings = cfg["vk"]
     if not settings["enabled"]:

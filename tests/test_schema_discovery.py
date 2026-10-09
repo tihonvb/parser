@@ -1,15 +1,21 @@
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
-from common import Lead
-from configuration import ConfigError
-from find_vk_groups import _evaluate
-from fix_sheet import infer_identity, migrate, migrate_rows
-from sheets_writer import HEADER, LEGACY_HEADER, SchemaConflict
-from stats import aggregate, from_store, overrides
-from storage import Store
-from vk_discovery import _get_city_id, find_candidates
+from lead_parser.application.statistics import from_store, overrides
+from lead_parser.infrastructure.configuration import ConfigError
+from lead_parser.infrastructure.integrations.google_sheets.gateway import SchemaConflict
+from lead_parser.infrastructure.integrations.google_sheets.migration import (
+    infer_identity,
+    migrate,
+    migrate_rows,
+)
+from lead_parser.infrastructure.integrations.google_sheets.reporting import aggregate
+from lead_parser.infrastructure.integrations.google_sheets.schema import HEADER, LEGACY_HEADER, lead_to_row
+from lead_parser.infrastructure.integrations.vk.assessment import _evaluate
+from lead_parser.infrastructure.integrations.vk.discovery import _get_city_id, find_candidates
+from lead_parser.infrastructure.persistence.sqlite import Store
 
 
 def test_migrate_legacy_preserves_all_rows_and_extra_columns():
@@ -51,13 +57,13 @@ def test_migration_dry_run_and_backup_precedes_write():
 
 
 def test_stable_ids_disambiguate_same_name_and_track_renames(cfg, lead):
-    second = Lead.from_dict(lead.to_dict())
+    second = deepcopy(lead)
     second.external_id = "-13_9"
     second.source_group_id = "vk:13"
-    renamed = Lead.from_dict(lead.to_dict())
+    renamed = deepcopy(lead)
     renamed.external_id = "-12_10"
     renamed.source_group = "New name"
-    records, _ = aggregate([lead.as_row(), second.as_row(), renamed.as_row()])
+    records, _ = aggregate([lead_to_row(lead), lead_to_row(second), lead_to_row(renamed)])
     assert len(records) == 2 and {r["source_id"]: r["total"] for r in records} == {"vk:12": 2, "vk:13": 1}
     assert set(overrides(records)["vk"]["group_overrides"]) == {"12", "13"}
     with Store(cfg["storage"]["database"]) as store:
@@ -70,7 +76,7 @@ def test_stable_ids_disambiguate_same_name_and_track_renames(cfg, lead):
 
 def test_unknown_source_ids_are_not_merged_by_name(lead):
     lead.source_group_id = ""
-    rows, _ = aggregate([lead.as_row(), lead.as_row()])
+    rows, _ = aggregate([lead_to_row(lead), lead_to_row(lead)])
     assert len(rows) == 2
 
 

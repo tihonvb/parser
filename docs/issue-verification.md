@@ -29,6 +29,8 @@ Issues не закрываются вручную до review/merge. PR связ
 
 ## Проверенный процесс разработки
 
-Локально проходят 95 тестов, `ruff check` и `ruff format --check`, безопасный пример конфигурации, offline eval и сравнение runtime export с lock. На синтетическом наборе ранний отбор: TP=14, FP=11, FN=0, TN=5; это полнота отбора кандидатов, а не качество языковой модели. Версионированный результат находится в `fixtures/prefilter-baseline.json`.
+После перехода на [слои и порты](architecture.md) локально проходят 124 теста, `ruff check` и `ruff format --check`, безопасный пример конфигурации, offline eval и сравнение runtime export с lock. Все прежние регрессионные сценарии сохранены. Дополнительные проверки защищают границы core/application, выполняют сценарии через in-memory ports, открывают SQLite schema v1 и проверяют атомарность маршрутов доставки. Собранные sdist/wheel проверяются установкой в отдельное окружение и запуском вне checkout; эти шаги добавлены в CI.
+
+На синтетическом наборе ранний отбор: TP=14, FP=11, FN=0, TN=5; это полнота отбора кандидатов, а не качество языковой модели. Набор входит в пакет (`src/lead_parser/resources/evaluation.jsonl`), версионированный результат находится в `fixtures/prefilter-baseline.json`.
 
 Первый [успешный Actions run](https://github.com/kwtpub/parser/actions/runs/37979969261) проверил исходный implementation commit на Python 3.12, 3.13 и 3.14. Последующие проверки актуальной ветки видны в [истории CI](https://github.com/kwtpub/parser/actions/workflows/checks.yml?query=branch%3Acodex%2Fcomplete-parser-issues). В upstream до включения/одобрения workflow администратором проверки не гарантированно появятся в PR; ссылки на проверки fork приложены к PR. Защита upstream и фактический запрет merge без review/check остаются частью #10, требующей владельца.

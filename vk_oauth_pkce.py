@@ -1,20 +1,6 @@
-"""Deprecated CLI aliases; all authorization uses the single vk_token manager.
+"""Compatibility entry point; implementation lives in lead_parser.interfaces.cli.vk_oauth_pkce."""
 
-step1 -> login; step2 now requires the complete callback URL (including state).
-Old code/device_id arguments cannot prove callback authenticity and are refused.
-"""
-
-import sys
-
-from vk_token import main as token_main
-
-
-def main(argv=None):
-    args = list(sys.argv[1:] if argv is None else argv)
-    if args:
-        args[0] = {"step1": "login", "step2": "code"}.get(args[0], args[0])
-    return token_main(args)
-
+from lead_parser.interfaces.cli.vk_oauth_pkce import main
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

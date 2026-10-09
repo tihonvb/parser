@@ -5,7 +5,7 @@ import pytest
 import requests
 import yaml
 
-from configuration import DEFAULTS, load_config
+from lead_parser.infrastructure.configuration import DEFAULTS, load_config
 
 
 @pytest.fixture(autouse=True)
@@ -19,7 +19,7 @@ def no_network(monkeypatch):
 
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
-    from configuration import ENV_MAP
+    from lead_parser.infrastructure.configuration import ENV_MAP
 
     for name in [*ENV_MAP, "VK_TOKEN"]:
         monkeypatch.delenv(name, raising=False)
@@ -30,7 +30,7 @@ def cfg(tmp_path, monkeypatch):
 
 @pytest.fixture
 def lead():
-    from common import Lead
+    from lead_parser.core.models import Lead
 
     return Lead(
         source="vk",

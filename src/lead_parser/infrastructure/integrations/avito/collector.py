@@ -10,8 +10,11 @@ import requests
 from playwright.sync_api import TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
 
-from common import Lead, ScanResult, extract_phone, matches_keywords
-from security import safe_error
+from lead_parser.application.models import ScanResult
+from lead_parser.application.ports import CollectionState
+from lead_parser.core.models import Lead
+from lead_parser.core.policies import extract_phone, matches_keywords
+from lead_parser.infrastructure.security import safe_error
 
 SELECTORS = {
     "card": '[data-marker="item"]',
@@ -185,7 +188,9 @@ def _listing(card, detail, cfg):
     )
 
 
-def collect_leads(cfg, store=None, reports=None):
+def collect_leads(
+    cfg: dict, store: CollectionState | None = None, reports: list[ScanResult] | None = None
+) -> list[Lead]:
     reports = reports if reports is not None else []
     settings = cfg["avito"]
     if not settings["enabled"]:

@@ -8,17 +8,23 @@ import os
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from common import Lead, ScanResult, unique_leads
+from lead_parser.application.errors import StorageError
+from lead_parser.application.models import ClassifiedLead, DeliveryPlan, LeadStatisticsRecord, ScanResult
+from lead_parser.core.models import Lead
+from lead_parser.core.policies import unique_leads
 
 SCHEMA_VERSION = 1
 
 
-class StorageError(RuntimeError):
-    pass
+def _decode_lead(value: dict) -> Lead:
+    return Lead(**{key: item for key, item in value.items() if key in Lead.__dataclass_fields__})
 
 
 class Store:
@@ -120,7 +126,7 @@ class Store:
                 key = lead.dedupe_key()
                 if self.db.execute("SELECT 1 FROM legacy_seen WHERE key=?", (key,)).fetchone():
                     continue
-                payload = json.dumps(lead.to_dict(), ensure_ascii=False)
+                payload = json.dumps(asdict(lead), ensure_ascii=False)
                 digest = hashlib.sha256(lead.text.encode()).hexdigest()
                 existing = self.db.execute("SELECT * FROM leads WHERE key=?", (key,)).fetchone()
                 if not existing:
@@ -132,12 +138,12 @@ class Store:
                 else:
                     # Do not change the snapshot of a classified/delivered lead implicitly.
                     if existing["ai_state"] == "pending":
-                        original = Lead.from_dict(json.loads(existing["payload"]))
+                        original = _decode_lead(json.loads(existing["payload"]))
                         merged = unique_leads([original, lead])[0]
                         self.db.execute(
                             "UPDATE leads SET payload=?,content_hash=?,last_seen=? WHERE key=?",
                             (
-                                json.dumps(merged.to_dict(), ensure_ascii=False),
+                                json.dumps(asdict(merged), ensure_ascii=False),
                                 hashlib.sha256(merged.text.encode()).hexdigest(),
                                 now,
                                 key,
@@ -151,7 +157,7 @@ class Store:
         row = self.db.execute("SELECT payload FROM leads WHERE key=?", (key,)).fetchone()
         if row is None:
             raise StorageError("Unknown lead key")
-        return Lead.from_dict(json.loads(row["payload"]))
+        return _decode_lead(json.loads(row["payload"]))
 
     def pending_ai(self, *, now: float | None = None, limit: int = 100) -> list[Lead]:
         now = time.time() if now is None else now
@@ -159,7 +165,7 @@ class Store:
             "SELECT payload FROM leads WHERE ai_state='pending' AND ai_next_at<=? ORDER BY first_seen,key LIMIT ?",
             (now, limit),
         ).fetchall()
-        return [Lead.from_dict(json.loads(row["payload"])) for row in rows]
+        return [_decode_lead(json.loads(row["payload"])) for row in rows]
 
     def classification(
         self,
@@ -172,7 +178,7 @@ class Store:
         retry_seconds: float = 60,
         now: float | None = None,
     ) -> None:
-        if state not in {"accepted", "rejected", "pending"}:
+        if state not in {"accepted", "rejected", "pending", "review"}:
             raise ValueError("Invalid classification state")
         now = time.time() if now is None else now
         with self.transaction():
@@ -187,7 +193,7 @@ class Store:
             self.db.execute(
                 "UPDATE leads SET payload=?,ai_state=?,ai_attempts=?,ai_next_at=?,verdict=?,ai_error=? WHERE key=?",
                 (
-                    json.dumps(lead.to_dict(), ensure_ascii=False),
+                    json.dumps(asdict(lead), ensure_ascii=False),
                     state,
                     attempts,
                     now + retry_seconds if state == "pending" else 0,
@@ -205,6 +211,62 @@ class Store:
                 "UPDATE leads SET ai_state='pending',ai_attempts=0,ai_next_at=0,ai_error=NULL WHERE key=?",
                 (key,),
             )
+
+    def save_classification(self, result: ClassifiedLead, *, max_attempts: int, retry_seconds: float) -> None:
+        """Map explicit decisions to the existing schema and Sheets metadata."""
+        lead = deepcopy(result.lead)
+        decision = result.decision
+        for key in ("ai_pending", "ai_error", "ai_is_client", "ai_confidence", "ai_reason"):
+            lead.extra.pop(key, None)
+        if decision.verdict is not None:
+            lead.extra.update(
+                ai_is_client=decision.verdict.is_client,
+                ai_confidence=decision.verdict.confidence,
+                ai_reason=decision.verdict.reason,
+            )
+        if decision.state == "pending":
+            lead.extra.update(ai_pending=True, ai_error=decision.error)
+        self.classification(
+            lead,
+            decision.state.value,
+            verdict=lead.extra,
+            error=decision.error or None,
+            max_attempts=max_attempts,
+            retry_seconds=retry_seconds,
+        )
+
+    def statistics_rows(self) -> Iterator[LeadStatisticsRecord]:
+        # Stream potentially large texts; consumers retain only per-source aggregates.
+        for row in self.db.execute(
+            "SELECT l.payload,l.ai_state,h.is_client FROM leads l "
+            "LEFT JOIN human_reviews h ON h.lead_key=l.key ORDER BY l.first_seen,l.key"
+        ):
+            yield LeadStatisticsRecord(
+                _decode_lead(json.loads(row["payload"])),
+                row["ai_state"],
+                bool(row["is_client"]) if row["is_client"] is not None else None,
+            )
+
+    def enqueue_plan(self, plan: DeliveryPlan) -> None:
+        if plan.primary is None:
+            return
+        # Freeze destinations at the first enqueue, atomically with the whole dependency graph.
+        with self.transaction():
+            keys = self.db.execute(
+                "SELECT key FROM leads WHERE ai_state='accepted' AND NOT EXISTS "
+                "(SELECT 1 FROM deliveries WHERE lead_key=leads.key)"
+            ).fetchall()
+            for (key,) in keys:
+                primary = self.db.execute(
+                    "INSERT INTO deliveries(lead_key,kind,destination,created) VALUES(?,?,?,?)",
+                    (key, plan.primary.kind, plan.primary.destination, time.time()),
+                ).lastrowid
+                for target in dict.fromkeys(plan.dependents):
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO deliveries(lead_key,kind,destination,depends_on,created) "
+                        "VALUES(?,?,?,?,?)",
+                        (key, target.kind, target.destination, primary, time.time()),
+                    )
 
     def cursor(self, source_id: str) -> dict[str, Any]:
         row = self.db.execute("SELECT cursor FROM sources WHERE id=?", (source_id,)).fetchone()
@@ -282,7 +344,7 @@ class Store:
                 "UPDATE deliveries SET state='leased',lease_owner=?,lease_until=? WHERE id=?",
                 (owner, now + lease_seconds, row["id"]),
             )
-            return {**dict(row), "lease_owner": owner}
+            return {**dict(row), "state": "leased", "lease_owner": owner, "lease_until": now + lease_seconds}
 
     def reserve_row(self, job: dict, minimum_row: int, *, existing_row: int | None = None) -> int:
         with self.transaction():

@@ -1,9 +1,13 @@
 import time
 from types import SimpleNamespace
 
-from storage import Store
-from vk_client import VKError
-from vk_parser import _execute_batch, _normalize_group_ref, collect_leads
+from lead_parser.infrastructure.integrations.vk.client import VKError
+from lead_parser.infrastructure.integrations.vk.collector import (
+    _execute_batch,
+    _normalize_group_ref,
+    collect_leads,
+)
+from lead_parser.infrastructure.persistence.sqlite import Store
 
 
 class Client:

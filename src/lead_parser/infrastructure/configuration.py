@@ -11,7 +11,14 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
+# Checkout commands retain their historical default even when invoked from elsewhere.
+# An installed wheel uses the caller's directory, with --config available explicitly.
+_CHECKOUT = Path(__file__).resolve().parents[3]
+CONFIG_PATH = (
+    _CHECKOUT
+    if (_CHECKOUT / "src" / "lead_parser").is_dir() and (_CHECKOUT / "pyproject.toml").is_file()
+    else Path.cwd()
+) / "config.yaml"
 
 
 class ConfigError(ValueError):

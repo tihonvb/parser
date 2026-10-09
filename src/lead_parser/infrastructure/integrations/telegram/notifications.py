@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import requests
 
-from common import Lead
+from lead_parser.application.errors import DeliveryError
+from lead_parser.application.models import DeliveryJob
+from lead_parser.core.models import Lead
+from lead_parser.infrastructure.security import delivery_error
 
 
-class NotificationError(RuntimeError):
+class NotificationError(DeliveryError):
     def __init__(self, code: int, *, retry_after: float = 0):
-        super().__init__(f"Telegram API error {code}")
-        self.permanent = code in {400, 401, 403, 404}
-        self.retry_after = retry_after
+        super().__init__(
+            f"Telegram API error {code}",
+            permanent=code in {400, 401, 403, 404},
+            retry_after=retry_after,
+        )
 
 
 def _format_message(lead: Lead) -> str:
@@ -53,19 +58,16 @@ def send_to(cfg: dict, lead: Lead, chat_id: str) -> None:
         raise NotificationError(int(code or 502), retry_after=float(delay or 0))
 
 
-def send_leads_notifications(cfg: dict, leads) -> None:
-    """Compatibility: queue recipients only after the durable Sheets job exists."""
-    from delivery import drain
-    from sheets_writer import destination
-    from storage import Store
+class TelegramGateway:
+    """One recipient per delivery job; retry policy stays in the application."""
 
-    with Store(cfg["storage"]["database"]) as store:
-        for lead in leads:
-            store.enqueue(
-                lead.dedupe_key(), destination(cfg), _collect_chat_ids(cfg["notifications"]["telegram"])
-            )
-        drain(cfg, store)
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
 
-
-def send_lead_notification(cfg: dict, lead: Lead) -> None:
-    send_leads_notifications(cfg, [lead])
+    def deliver(self, lead: Lead, job: DeliveryJob) -> None:
+        try:
+            send_to(self.cfg, lead, job["destination"])
+        except DeliveryError:
+            raise
+        except Exception as error:
+            raise delivery_error(error) from error

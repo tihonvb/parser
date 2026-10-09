@@ -7,13 +7,19 @@ import pytest
 import requests
 import yaml
 
-import ai_filter
-from ai_filter import InvalidVerdict, _build_user_prompt, filter_leads, validate_verdicts
-from common import matches_keywords
-from configuration import DEFAULTS, ConfigError, load_config
-from main import main, run_once
-from security import private_json, safe_error
-from storage import Store
+import lead_parser.infrastructure.integrations.openrouter.classifier as ai_filter
+from lead_parser.bootstrap import run_once
+from lead_parser.core.policies import matches_keywords
+from lead_parser.infrastructure.configuration import DEFAULTS, ConfigError, load_config
+from lead_parser.infrastructure.integrations.openrouter.classifier import (
+    InvalidVerdict,
+    _build_user_prompt,
+    filter_leads,
+    validate_verdicts,
+)
+from lead_parser.infrastructure.persistence.sqlite import Store
+from lead_parser.infrastructure.security import private_json, safe_error
+from lead_parser.interfaces.cli.main import main
 
 
 @pytest.mark.parametrize(

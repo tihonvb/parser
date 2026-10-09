@@ -7,8 +7,9 @@ import pytest
 import requests
 from filelock import Timeout
 
-from security import private_json
-from vk_token import TokenError, TokenManager, main
+from lead_parser.infrastructure.integrations.vk.oauth import TokenError, TokenManager
+from lead_parser.infrastructure.security import private_json
+from lead_parser.interfaces.cli.vk_token import main
 
 
 def callback(manager, *, state=None):
