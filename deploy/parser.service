@@ -7,8 +7,9 @@ Wants=network-online.target
 Type=oneshot
 User=parser
 Group=parser
-WorkingDirectory=/opt/parser
-ExecStart=/opt/parser/.venv/bin/lead-parser --config /var/lib/parser/config.yaml
+WorkingDirectory=/opt/parser/current
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/parser/current/.browsers
+ExecStart=/opt/parser/current/.venv/bin/lead-parser --config /var/lib/parser/config.yaml
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
