@@ -33,6 +33,7 @@ from lead_parser.infrastructure.integrations.telegram.notifications import Teleg
 from lead_parser.infrastructure.integrations.vk import collector as vk
 from lead_parser.infrastructure.integrations.vk.oauth import TokenManager
 from lead_parser.infrastructure.persistence.sqlite import Store
+from lead_parser.infrastructure.persistence.usage_log import UsageLog
 from lead_parser.infrastructure.security import delivery_error
 
 
@@ -56,8 +57,10 @@ def build_sources(cfg: dict) -> tuple[LeadSource, ...]:
     )
 
 
-def build_classifier(cfg: dict) -> OpenRouterClassifier:
-    return OpenRouterClassifier(cfg)
+def build_classifier(cfg: dict, *, purpose: str = "pipeline") -> OpenRouterClassifier:
+    return OpenRouterClassifier(
+        cfg, UsageLog(str(cfg["storage"]["database"]) + ".usage.jsonl"), purpose=purpose
+    )
 
 
 @dataclass

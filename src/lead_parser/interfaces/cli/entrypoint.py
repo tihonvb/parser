@@ -7,6 +7,7 @@ COMMANDS = {
     "run": "main",
     "evaluate": "evaluate",
     "stats": "stats",
+    "analytics": "analytics",
     "discover": "discover",
     "vk-auth": "vk_token",
     "telegram-auth": "telegram_parser",

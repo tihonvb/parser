@@ -43,6 +43,7 @@ vk_pkce_state.json
 .ruff_cache/
 reports/
 *.log
+*.usage.jsonl
 dist/
 /release.tar.gz
 build/

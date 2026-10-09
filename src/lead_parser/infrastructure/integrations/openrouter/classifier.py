@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
+from collections import Counter
 
 import requests
 
@@ -12,8 +14,10 @@ from lead_parser.application.models import ClassifiedLead
 from lead_parser.core.models import ClassificationDecision, ClassificationState, Lead, Verdict
 from lead_parser.core.policies import decide_classification, unique_leads
 from lead_parser.infrastructure.configuration import ConfigError, _filled
+from lead_parser.infrastructure.persistence.usage_log import UsageLog, UsageLogError
 from lead_parser.infrastructure.security import safe_error
 
+logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 PROMPT_VERSION = "client-request-v2"
 SYSTEM_PROMPT = """Ты классифицируешь заявки на {work_type} для города {city}.
@@ -114,16 +118,51 @@ def _classify_batch(cfg: dict, batch: list[Lead]) -> dict[int, dict]:
             {"role": "user", "content": _build_user_prompt(batch, cfg)},
         ],
     }
-    response = requests.post(
-        OPENROUTER_URL,
-        headers={"Authorization": f"Bearer {settings['openrouter_api_key']}"},
-        json=payload,
-        timeout=(10, settings.get("timeout_seconds", 60)),
-    )
-    response.raise_for_status()
-    data = response.json()
-    parsed = _extract_json_array(data["choices"][0]["message"]["content"])
-    return validate_verdicts(parsed, len(batch))
+    usage_log = cfg.get("_usage_log")
+    request = None
+    if usage_log is not None:
+        # If this durable write fails, no paid HTTP request has happened yet.
+        request = usage_log.start(
+            requested_model=settings["model"],
+            batch_size=len(batch),
+            purpose=cfg.get("_usage_purpose", "pipeline"),
+            source_counts=dict(Counter(lead.source for lead in batch)),
+        )
+    data = None
+    outcome = "error"
+    failure = None
+    try:
+        response = requests.post(
+            OPENROUTER_URL,
+            headers={"Authorization": f"Bearer {settings['openrouter_api_key']}"},
+            json=payload,
+            timeout=(10, settings.get("timeout_seconds", 60)),
+        )
+        # Some error responses still contain accounting information. Retain it
+        # before status/output validation; never persist the response body.
+        try:
+            data = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise
+        response.raise_for_status()
+        parsed = _extract_json_array(data["choices"][0]["message"]["content"])
+        results = validate_verdicts(parsed, len(batch))
+        outcome = "success" if len(results) == len(batch) else "partial"
+        return results
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if request is not None:
+            try:
+                usage_log.finish(request, response=data, outcome=outcome, error=failure)
+            except UsageLogError:
+                # Do not turn a valid paid response into a retry. The durable
+                # start remains visible as an attempt with an unknown charge.
+                logger.error(
+                    "AI usage completion could not be persisted: request_id=%s", request["request_id"]
+                )
 
 
 def filter_leads(cfg: dict, leads: list[Lead]) -> list[Lead]:
@@ -145,7 +184,14 @@ def filter_leads(cfg: dict, leads: list[Lead]) -> list[Lead]:
         batch = leads[start : start + settings.get("batch_size", 8)]
         try:
             results = _classify_batch(cfg, batch)
-        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as error:
+        except (
+            requests.RequestException,
+            UsageLogError,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+        ) as error:
             for lead in batch:
                 lead.extra["ai_pending"] = True
                 lead.extra["ai_error"] = safe_error(error)
@@ -186,8 +232,8 @@ def _sync_metadata(originals: list[Lead], classified: list[Lead]) -> None:
 class OpenRouterClassifier:
     """Convert provider metadata into an explicit, provider-independent outcome."""
 
-    def __init__(self, cfg: dict):
-        self.cfg = cfg
+    def __init__(self, cfg: dict, usage_log: UsageLog | None = None, *, purpose: str = "pipeline"):
+        self.cfg = {**cfg, "_usage_log": usage_log, "_usage_purpose": purpose}
 
     def classify(self, leads: list[Lead]) -> list[ClassifiedLead]:
         candidates = unique_leads(leads)

@@ -1,5 +1,7 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from filelock import FileLock, Timeout
@@ -12,6 +14,60 @@ from lead_parser.core.models import Lead
 from lead_parser.infrastructure.integrations.google_sheets.gateway import SheetsWriter
 from lead_parser.infrastructure.persistence.sqlite import Store
 from tests.test_storage_delivery import Worksheet
+
+
+def test_production_pipeline_and_evaluation_log_separately_for_snapshot_report(
+    cfg, lead, tmp_path, monkeypatch, capsys
+):
+    from lead_parser.interfaces.cli.entrypoint import main as entrypoint
+
+    cfg["ai_filter"].update(enabled=True, openrouter_api_key="test")
+    response = Mock()
+    response.json.return_value = {
+        "id": "gen-test",
+        "model": "provider/model",
+        "usage": {"cost": "0.02", "prompt_tokens": 100, "completion_tokens": 10},
+        "choices": [
+            {"message": {"content": '[{"index":0,"is_client":true,"confidence":0.9,"reason":"request"}]'}}
+        ],
+    }
+    post = Mock(return_value=response)
+    monkeypatch.setattr(ai_filter.requests, "post", post)
+    with Store(cfg["storage"]["database"]) as store:
+        store.ingest([lead])
+    code, summary = main.run_once(cfg, deliver_only=True)
+    assert code == 0 and summary["leads"] == {"accepted": 1}
+    main.build_classifier(cfg, purpose="evaluation").classify([lead])
+    assert post.call_count == 2
+    assert main.run_once(cfg, deliver_only=True)[0] == 0
+    assert post.call_count == 2  # Restart must not pay again for an accepted lead.
+    snapshot = tmp_path / "snapshot.sqlite3"
+    with Store(cfg["storage"]["database"]) as store:
+        store.backup(snapshot)
+    today = datetime.now(UTC).date()
+    assert (
+        entrypoint(
+            [
+                "analytics",
+                "--database",
+                str(snapshot),
+                "--from",
+                (today - timedelta(days=1)).isoformat(),
+                "--to",
+                (today + timedelta(days=1)).isoformat(),
+                "--usage-log",
+                cfg["storage"]["database"] + ".usage.jsonl",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["cohort"]["accepted"] == 1
+    assert report["ai_usage"]["requests"] == 1
+    assert report["ai_usage"]["known_cost_usd"] == "0.02"
+    assert report["economics"]["total_cost_usd"] is None
 
 
 def test_full_pipeline_partial_sources_and_restart_without_reclassification(cfg, lead, monkeypatch):

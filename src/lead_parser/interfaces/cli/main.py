@@ -20,7 +20,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "Additional lead-parser commands: evaluate, stats, discover, vk-auth, telegram-auth, "
+            "Additional lead-parser commands: evaluate, stats, analytics, discover, vk-auth, telegram-auth, "
             "migrate-sheet, vk-discovery, telegram-discovery, vk-groups, extract-vk-groups. "
             "Use COMMAND --help for command-specific options."
         ),

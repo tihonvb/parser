@@ -125,6 +125,10 @@ uv run --locked lead-parser stats --config config.yaml --write
 
 Команды `lead-parser discover`, `lead-parser vk-discovery`, `lead-parser telegram-discovery` пишут CSV для ручного отбора и не меняют подписки/конфиг. `lead-parser vk-groups search` ищет по настроенному городу; `lead-parser vk-groups check candidates.txt` оценивает ссылки, страницы и фактическое покрытие `discovery.days`. Неоднозначный город VK требует явного `discovery.city_id`; неизвестная численность сохраняется как неизвестная. `lead-parser extract-vk-groups` читает устойчивые ID из SQLite без сети. Для discovery нужны настроенные авторизованные интеграции; отсутствие доступа не означает отсутствие источников.
 
+## Экономика и отчёт по проду
+
+`lead-parser analytics --database /absolute/path/snapshot.sqlite3 --from 2026-10-01 --to 2026-10-10` читает отдельный snapshot без ключей и сети: новые кандидаты, текущие оценки, источники и первые доставки за период. Расходы OpenRouter собираются в `<storage.database>.usage.jsonl`; online evaluation учитывается отдельно. Полная стоимость лида рассчитывается после указания фактических расходов ИИ и сервера/сервисов. [Данные для первого отчёта, команды и ограничения метрик](docs/analytics.md).
+
 ## Разработка и обновление
 
 ```bash

@@ -43,7 +43,7 @@ def main(argv=None):
     report = evaluate(
         evaluation_settings(cfg),
         load_dataset(args.dataset),
-        classifier=build_classifier(cfg) if args.online else None,
+        classifier=build_classifier(cfg, purpose="evaluation") if args.online else None,
     )
     output = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
