@@ -117,3 +117,13 @@ def test_loop_reloads_configuration_and_refreshes_vk_each_cycle(cfg, monkeypatch
     monkeypatch.setattr(main.time, "sleep", next_cycle)
     assert main.main(["--config", str(path), "--loop"]) == 0
     assert seen == [("token-1", "Самара"), ("token-2", "Казань")]
+
+
+def test_status_can_inspect_inbox_without_expired_api_credentials(cfg):
+    import yaml
+
+    cfg["ai_filter"].update(enabled=True, openrouter_api_key="")
+    path = Path(cfg["_config_path"])
+    path.write_text(yaml.safe_dump({key: value for key, value in cfg.items() if not key.startswith("_")}))
+    assert main.main(["--config", str(path), "--status"]) == 0
+    assert main.main(["--config", str(path), "--check-config"]) == 2

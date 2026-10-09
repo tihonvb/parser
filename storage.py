@@ -225,6 +225,8 @@ class Store:
                             "candidates": result.candidates,
                             "errors": result.errors,
                             "prefilter": result.prefilter,
+                            "coverage": result.coverage,
+                            "window": result.window,
                         },
                         ensure_ascii=False,
                     ),
@@ -363,8 +365,8 @@ class Store:
                 r[0]: r[1] for r in self.db.execute("SELECT state,COUNT(*) FROM deliveries GROUP BY state")
             },
             "sources": [
-                {"id": r[0], **json.loads(r[1])}
-                for r in self.db.execute("SELECT id,report FROM sources ORDER BY id")
+                {"id": r[0], "updated_at": r[2], **json.loads(r[1])}
+                for r in self.db.execute("SELECT id,report,updated FROM sources ORDER BY id")
             ],
         }
 

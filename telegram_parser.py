@@ -16,6 +16,10 @@ from configuration import load_config
 from security import safe_error
 
 
+class TelegramAuthorizationRequired(RuntimeError):
+    pass
+
+
 async def _collect_from_channel(client, channel, cfg, store=None, reports=None) -> list[Lead]:
     settings = cfg["telegram"]
     result = ScanResult(f"telegram:ref:{channel}")
@@ -51,6 +55,7 @@ async def _collect_from_channel(client, channel, cfg, store=None, reports=None) 
                 }
             )
             result.cursor = cursor.copy()
+            result.window = {"cutoff": cursor.get("cutoff", 0), "min_message_id": cursor.get("min_id", 0)}
             budget = override.get("max_messages_per_channel", settings["max_messages_per_channel"])
             page_size = override.get("messages_per_run", settings["messages_per_run"])
             options = {"limit": budget + 1, "min_id": cursor.get("min_id", 0)}
@@ -82,7 +87,7 @@ async def _collect_from_channel(client, channel, cfg, store=None, reports=None) 
                         source_group=getattr(entity, "title", str(channel)),
                         source_group_id=result.source_id,
                         url=f"https://t.me/{username}/{message.id}" if username else "",
-                        extra={"known_city": cfg["general"]["city"]},
+                        extra={"known_city": cfg["general"]["city"], "source_ref": str(channel)},
                     )
                     # Sender lookup is optional metadata; it must not block cursor advancement.
                     lead.author = str(getattr(message, "sender_id", "") or "")
@@ -137,7 +142,7 @@ async def collect_leads_async(cfg: dict, store=None, reports=None) -> list[Lead]
     try:
         await asyncio.wait_for(client.connect(), timeout=settings["channel_timeout_seconds"])
         if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
-            raise RuntimeError("TelegramAuthorizationRequired: run telegram_parser.py login interactively")
+            raise TelegramAuthorizationRequired("Run telegram_parser.py login interactively")
         semaphore = asyncio.Semaphore(settings["max_concurrent_channels"])
 
         async def bounded(channel):

@@ -330,6 +330,8 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
         raise ConfigError("Cannot read configuration; check path and YAML syntax") from error
     if not isinstance(value, dict):
         raise ConfigError("Configuration must be a YAML mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ConfigError("Configuration section names must be strings")
     unknown = set(value) - set(DEFAULTS)
     if unknown:
         raise ConfigError("Unknown configuration sections: " + ", ".join(sorted(unknown)))

@@ -117,7 +117,7 @@ def _run_batched(client, tasks):
     ]
 
 
-def _scan_group(client, gid, names, cfg, store, reports):
+def _scan_group(client, gid, names, cfg, store, reports, source_ref=""):
     settings = cfg["vk"]
     result = ScanResult(f"vk:{gid}")
     previous = store.cursor(result.source_id) if store else {}
@@ -136,6 +136,7 @@ def _scan_group(client, gid, names, cfg, store, reports):
     offset, new_anchor, anchor_index = 0, None, 0
     leads = []
     result.complete = False
+    result.window = {"cutoff": cutoff, "checkpoint_upper": started}
     try:
         if previous.get("offset"):
             front = _execute_batch(client, [("wall.get", {"owner_id": -gid, "count": count, "offset": 0})])[0]
@@ -151,6 +152,8 @@ def _scan_group(client, gid, names, cfg, store, reports):
                     )
                 )
             ]
+            for lead in front_leads:
+                lead.extra.update(known_city=cfg["general"]["city"], source_ref=str(source_ref))
             if store:
                 store.ingest(front_leads)
             leads.extend(front_leads)
@@ -190,6 +193,7 @@ def _scan_group(client, gid, names, cfg, store, reports):
                 )
                 if lead:
                     lead.extra["known_city"] = cfg["general"]["city"]
+                    lead.extra["source_ref"] = str(source_ref)
                     page.append(lead)
             result.scanned += len(items)
             result.candidates += len(page)
@@ -244,9 +248,13 @@ def collect_leads(cfg, store=None, reports=None, client=None):
         try:
             ids, names = _resolve_groups(client.get_api(), [ref])
             for gid in ids:
-                leads.extend(_scan_group(client, gid, names, cfg, store, reports))
+                leads.extend(_scan_group(client, gid, names, cfg, store, reports, source_ref=ref))
         except Exception as error:
-            result = ScanResult("vk:ref:" + _normalize_group_ref(ref))
+            try:
+                identity = _normalize_group_ref(ref)
+            except ValueError:
+                identity = "invalid-reference"
+            result = ScanResult("vk:ref:" + identity)
             result.fail(f"VK:{error.code}" if isinstance(error, VKError) else safe_error(error))
             reports.append(result)
             if store:
@@ -258,7 +266,7 @@ def collect_leads(cfg, store=None, reports=None, client=None):
             else client
         )
         for keyword in cfg["general"]["keywords"]:
-            result = ScanResult("vk:search:" + keyword)
+            result = ScanResult("vk:search:" + keyword, coverage="best_effort_search")
             previous = store.cursor(result.source_id) if store else {}
             params = {
                 "q": keyword + " " + cfg["general"]["city"],
@@ -267,6 +275,7 @@ def collect_leads(cfg, store=None, reports=None, client=None):
             }
             if previous.get("next_from"):
                 params["start_from"] = previous["next_from"]
+            result.window = {"cutoff": params["start_time"]}
             try:
                 for _ in range(settings["max_pages_per_query"]):
                     response = _execute_batch(search, [("newsfeed.search", params)])[0]

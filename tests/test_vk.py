@@ -156,3 +156,11 @@ def test_response_size_splits_then_direct_fallback(monkeypatch):
         {"items": [1]},
         {"items": [2]},
     ]
+
+
+def test_invalid_group_ref_does_not_cancel_other_group(cfg):
+    cfg["vk"].update(enabled=True, group_ids=["invalid/ref", 12])
+    reports = []
+    leads = collect_leads(cfg, reports=reports, client=Client(posts(250)))
+    assert leads and reports[0].source_id == "vk:ref:invalid-reference" and not reports[0].complete
+    assert reports[1].complete and leads[0].extra["source_ref"] == "12"

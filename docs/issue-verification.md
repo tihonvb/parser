@@ -26,3 +26,9 @@
 | [#20](https://github.com/tihonvb/parser/issues/20) | Единственный VK TokenManager, wrappers, legacy migration, expiry/rotation/lock, обязательный state/TTL | `tests/test_auth.py`; токены в captured logs отсутствуют |
 
 Issues не закрываются вручную до review/merge. PR связывает реализации с задачами. #10 не помечается полностью выполненной без фактически установленной защиты main.
+
+## Проверенный процесс разработки
+
+Локально проходят 95 тестов, `ruff check` и `ruff format --check`, безопасный пример конфигурации, offline eval и сравнение runtime export с lock. На синтетическом наборе ранний отбор: TP=14, FP=11, FN=0, TN=5; это полнота отбора кандидатов, а не качество языковой модели. Версионированный результат находится в `fixtures/prefilter-baseline.json`.
+
+Первый [успешный Actions run](https://github.com/kwtpub/parser/actions/runs/37979969261) проверил исходный implementation commit на Python 3.12, 3.13 и 3.14. Последующие проверки актуальной ветки видны в [истории CI](https://github.com/kwtpub/parser/actions/workflows/checks.yml?query=branch%3Acodex%2Fcomplete-parser-issues). В upstream до включения/одобрения workflow администратором проверки не гарантированно появятся в PR; ссылки на проверки fork приложены к PR. Защита upstream и фактический запрет merge без review/check остаются частью #10, требующей владельца.

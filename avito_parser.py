@@ -198,7 +198,9 @@ def collect_leads(cfg, store=None, reports=None):
             resources.open()
             page, detail = resources.page(), resources.page()
             for query in settings["search_queries"]:
-                result = ScanResult("avito:search:" + settings["city_slug"] + ":" + query)
+                result = ScanResult(
+                    "avito:search:" + settings["city_slug"] + ":" + query, coverage="first_page_best_effort"
+                )
                 try:
                     response = page.goto(
                         _build_url(settings["city_slug"], query),

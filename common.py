@@ -134,6 +134,8 @@ class ScanResult:
     errors: list[str] = field(default_factory=list)
     cursor: dict[str, Any] = field(default_factory=dict)
     prefilter: dict[str, int] = field(default_factory=dict)
+    coverage: str = "configured_window"
+    window: dict[str, Any] = field(default_factory=dict)
 
     def counted(self, reason: str) -> None:
         self.prefilter[reason] = self.prefilter.get(reason, 0) + 1

@@ -72,6 +72,9 @@ def run_once(cfg: dict, *, deliver_only=False) -> tuple[int, dict]:
                         "scanned": item.scanned,
                         "candidates": item.candidates,
                         "errors": item.errors,
+                        "prefilter": item.prefilter,
+                        "coverage": item.coverage,
+                        "window": item.window,
                     }
                     for item in reports
                 ],
@@ -101,7 +104,8 @@ def main(argv=None) -> int:
     parser.add_argument("--retry-failed", action="store_true")
     args = parser.parse_args(argv)
     try:
-        cfg = load_config(args.config)
+        storage_command = args.status or args.backup or args.reclassify or args.retry_failed
+        cfg = load_config(args.config, require_access=not storage_command or args.check_config)
         if args.check_config:
             print("Configuration valid; no API calls made.")
             return 0
