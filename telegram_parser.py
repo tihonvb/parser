@@ -1,137 +1,194 @@
-"""Мониторинг Telegram-каналов/групп через официальный MTProto API (Telethon).
-
-Никакого браузера/антидетекта не требуется — это штатный протокол Telegram,
-работающий от имени вашего аккаунта (при первом запуске Telethon попросит
-код подтверждения в консоли, дальше сессия сохраняется в файл).
-
-Каналы обрабатываются параллельно (с ограничением одновременных, см.
-config.yaml -> telegram.max_concurrent_channels) — это важно, если каналов
-много: последовательный обход по одному был бы намного медленнее.
-
-Название канала/группы пишется в Lead.source_group — по нему потом
-строится статистика (см. stats.py), какие каналы дают больше всего
-реальных заказов.
-
-telegram.channel_overrides позволяет сканировать отдельные "горячие"
-каналы активнее остальных (больше сообщений за прогон и/или более
-глубокий lookback_hours), не трогая общие messages_per_run/lookback_hours
-— см. пример в config.yaml. Обычно это заполняют по подсказке из
-stats.py, после того как накопилась статистика.
-"""
+"""Isolated channel scans with durable pages and stable message-ID cursors."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-from datetime import datetime, timedelta, timezone
+import os
+import time
+from pathlib import Path
 
 from telethon import TelegramClient
-from telethon.errors import (
-    ChannelPrivateError,
-    FloodWaitError,
-    UsernameInvalidError,
-)
+from telethon.errors import FloodWaitError
 
-from common import Lead, extract_phone, matches_keywords
+from common import Lead, ScanResult, extract_phone, keyword_decision
+from configuration import load_config
+from security import safe_error
 
 
-async def _collect_from_channel(client: TelegramClient, channel: str, cfg: dict) -> list[Lead]:
-    tg_cfg = cfg["telegram"]
-    general = cfg["general"]
+async def _collect_from_channel(client, channel, cfg, store=None, reports=None) -> list[Lead]:
+    settings = cfg["telegram"]
+    result = ScanResult(f"telegram:ref:{channel}")
+    leads = []
+    page = []
+    cursor = {}
+    oldest = None
 
-    # "Горячие" каналы можно сканировать глубже/чаще остальных — см.
-    # telegram.channel_overrides в config.yaml (обычно заполняется по
-    # подсказке stats.py, когда накопится статистика по источникам).
-    overrides = tg_cfg.get("channel_overrides") or {}
-    chan_override = overrides.get(channel, {})
-    lookback_hours = chan_override.get("lookback_hours", tg_cfg.get("lookback_hours", 48))
-    messages_per_run = chan_override.get("messages_per_run", tg_cfg.get("messages_per_run", 200))
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    leads: list[Lead] = []
+    def commit_page():
+        if store:
+            store.ingest(page)
+            result.cursor = {**cursor, "resume_max_id": oldest}
+            store.checkpoint(result)
+        page.clear()
 
     try:
-        entity = await client.get_entity(channel)
-    except (ValueError, UsernameInvalidError):
-        print(f"[telegram] Не удалось найти канал/группу: {channel} — пропускаю")
-        return leads
-    except ChannelPrivateError:
-        print(f"[telegram] Нет доступа к приватному каналу: {channel} — пропускаю")
-        return leads
-
-    source_group = getattr(entity, "title", None) or str(channel)
-
-    try:
-        async for msg in client.iter_messages(entity, limit=messages_per_run):
-            if not msg.text:
-                continue
-            if msg.date and msg.date < cutoff:
-                break  # сообщения идут от новых к старым — дальше всё старее cutoff
-            if not matches_keywords(msg.text, general["keywords"], general.get("exclude_keywords")):
-                continue
-
-            sender = None
-            try:
-                sender = await msg.get_sender()
-            except Exception:
-                pass
-            author = ""
-            if sender is not None:
-                author = getattr(sender, "username", None) or " ".join(
-                    filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])
-                ).strip()
-
-            channel_username = getattr(entity, "username", None)
-            link = f"https://t.me/{channel_username}/{msg.id}" if channel_username else ""
-
-            leads.append(
-                Lead(
-                    source="telegram",
-                    external_id=f"{getattr(entity, 'id', channel)}_{msg.id}",
-                    date=msg.date.isoformat() if msg.date else "",
-                    author=author,
-                    text=msg.text,
-                    phone=extract_phone(msg.text) or "",
-                    url=link,
-                    source_group=source_group,
-                )
+        async with asyncio.timeout(settings["channel_timeout_seconds"]):
+            entity = await client.get_entity(channel)
+            identity = str(entity.id)
+            result.source_id = "telegram:" + identity
+            overrides = settings.get("channel_overrides", {})
+            override = overrides.get(identity, overrides.get(str(channel), {}))
+            previous = store.cursor(result.source_id) if store else {}
+            cursor = (
+                previous
+                if previous.get("resume_max_id")
+                else {
+                    "min_id": previous.get("high_watermark", 0),
+                    "cutoff": time.time() - override.get("lookback_hours", settings["lookback_hours"]) * 3600
+                    if not previous
+                    else 0,
+                    "scan_upper": 0,
+                }
             )
-    except FloodWaitError as e:
-        print(f"[telegram] Флуд-контроль Telegram: нужно подождать {e.seconds} сек. Пропускаю остаток канала {channel}.")
-
+            result.cursor = cursor.copy()
+            budget = override.get("max_messages_per_channel", settings["max_messages_per_channel"])
+            page_size = override.get("messages_per_run", settings["messages_per_run"])
+            options = {"limit": budget + 1, "min_id": cursor.get("min_id", 0)}
+            if cursor.get("resume_max_id"):
+                options["max_id"] = cursor["resume_max_id"]
+            async for message in client.iter_messages(entity, **options):
+                if result.scanned >= budget:
+                    result.complete = False
+                    break
+                stamp = message.date.timestamp() if message.date else None
+                if stamp is not None and stamp < cursor.get("cutoff", 0):
+                    break
+                cursor["scan_upper"] = max(cursor.get("scan_upper", 0), message.id)
+                oldest = message.id
+                result.scanned += 1
+                text = message.text or ""
+                passed, reason = keyword_decision(
+                    text, cfg["general"]["keywords"], cfg["general"]["exclude_keywords"]
+                )
+                result.counted(reason)
+                if passed:
+                    username = getattr(entity, "username", None)
+                    lead = Lead(
+                        source="telegram",
+                        external_id=f"{identity}_{message.id}",
+                        date=message.date.isoformat() if message.date else "",
+                        text=text,
+                        phone=extract_phone(text) or "",
+                        source_group=getattr(entity, "title", str(channel)),
+                        source_group_id=result.source_id,
+                        url=f"https://t.me/{username}/{message.id}" if username else "",
+                        extra={"known_city": cfg["general"]["city"]},
+                    )
+                    # Sender lookup is optional metadata; it must not block cursor advancement.
+                    lead.author = str(getattr(message, "sender_id", "") or "")
+                    leads.append(lead)
+                    page.append(lead)
+                    result.candidates += 1
+                if result.scanned % page_size == 0:
+                    result.complete = False
+                    commit_page()
+                    result.complete = True
+            commit_page()
+            result.cursor = (
+                {"high_watermark": max(cursor.get("min_id", 0), cursor.get("scan_upper", 0))}
+                if result.complete
+                else {**cursor, "resume_max_id": oldest or cursor.get("resume_max_id")}
+            )
+    except asyncio.CancelledError:
+        result.fail("Cancelled")
+        commit_page()
+        if reports is not None:
+            reports.append(result)
+        raise
+    except FloodWaitError as error:
+        result.fail(f"FloodWait:{error.seconds}")
+        commit_page()
+    except Exception as error:
+        result.fail(safe_error(error))
+        commit_page()
+    finally:
+        if store:
+            store.checkpoint(result)
+    if reports is not None:
+        reports.append(result)
     return leads
 
 
-async def collect_leads_async(cfg: dict) -> list[Lead]:
-    tg_cfg = cfg["telegram"]
-    if not tg_cfg.get("enabled", True):
+async def collect_leads_async(cfg: dict, store=None, reports=None) -> list[Lead]:
+    settings = cfg["telegram"]
+    if not settings["enabled"]:
         return []
-    channels = tg_cfg.get("channels") or []
-    if not channels:
-        print("[telegram] Список каналов пуст (telegram.channels в config.yaml) — нечего парсить.")
-        return []
-
-    client = TelegramClient(tg_cfg["session_name"], int(tg_cfg["api_id"]), tg_cfg["api_hash"])
-    await client.start()  # при первом запуске спросит номер телефона и код в консоли
-
-    max_concurrent = max(1, tg_cfg.get("max_concurrent_channels", 5))
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def _bounded(channel: str) -> list[Lead]:
-        async with semaphore:
-            return await _collect_from_channel(client, channel, cfg)
-
-    all_leads: list[Lead] = []
+    session = Path(settings["session_name"])
+    session.parent.mkdir(parents=True, exist_ok=True)
+    client = TelegramClient(
+        str(session),
+        int(settings["api_id"]),
+        settings["api_hash"],
+        flood_sleep_threshold=0,
+        request_retries=1,
+        connection_retries=1,
+        timeout=10,
+    )
     try:
-        print(f"[telegram] Обрабатываю {len(channels)} каналов (до {max_concurrent} одновременно)...")
-        results = await asyncio.gather(*(_bounded(ch) for ch in channels))
-        for leads in results:
-            all_leads.extend(leads)
+        await asyncio.wait_for(client.connect(), timeout=settings["channel_timeout_seconds"])
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
+            raise RuntimeError("TelegramAuthorizationRequired: run telegram_parser.py login interactively")
+        semaphore = asyncio.Semaphore(settings["max_concurrent_channels"])
+
+        async def bounded(channel):
+            async with semaphore:
+                return await _collect_from_channel(client, channel, cfg, store, reports)
+
+        batches = await asyncio.gather(
+            *(bounded(channel) for channel in settings["channels"]), return_exceptions=True
+        )
+        return [lead for batch in batches if isinstance(batch, list) for lead in batch]
     finally:
-        await client.disconnect()
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=15)
+        except Exception as error:
+            result = ScanResult("telegram:cleanup")
+            result.fail(safe_error(error))
+            if reports is not None:
+                reports.append(result)
+            if store:
+                store.checkpoint(result)
+        finally:
+            for path in session.parent.glob(session.name + ".session*"):
+                if os.name == "posix":
+                    path.chmod(0o600)
 
-    return all_leads
+
+def collect_leads(cfg: dict, store=None, reports=None) -> list[Lead]:
+    return asyncio.run(collect_leads_async(cfg, store, reports))
 
 
-def collect_leads(cfg: dict) -> list[Lead]:
-    """Синхронная обёртка для вызова из main.py."""
-    return asyncio.run(collect_leads_async(cfg))
+def main():
+    parser = argparse.ArgumentParser(description="Explicit interactive Telegram login")
+    parser.add_argument("command", choices=["login"])
+    parser.add_argument("--config", default=None)
+    args = parser.parse_args()
+    cfg = load_config(args.config) if args.config else load_config()
+
+    async def login():
+        settings = cfg["telegram"]
+        Path(settings["session_name"]).parent.mkdir(parents=True, exist_ok=True)
+        client = TelegramClient(settings["session_name"], int(settings["api_id"]), settings["api_hash"])
+        try:
+            await client.start()
+        finally:
+            await client.disconnect()
+            path = Path(settings["session_name"] + ".session")
+            if path.exists() and os.name == "posix":
+                path.chmod(0o600)
+
+    asyncio.run(login())
+
+
+if __name__ == "__main__":
+    main()

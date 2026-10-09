@@ -1,0 +1,44 @@
+name: Parser checks
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    name: checks (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.10'
+          enable-cache: true
+      - run: uv sync --locked --python '${{ matrix.python }}'
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked pytest -q
+      - run: uv run --locked python main.py --config config.example.yaml --check-config
+      - run: uv run --locked python evaluate.py --config config.example.yaml --output reports/offline.json
+      - run: uv run --locked python scripts/check_secrets.py
+      - name: Verify exported runtime dependencies
+        run: |
+          uv export --locked --no-dev --no-emit-project --no-header --output-file /tmp/parser-requirements.txt > /dev/null
+          diff requirements.txt /tmp/parser-requirements.txt

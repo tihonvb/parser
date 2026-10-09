@@ -1,316 +1,313 @@
-"""Сбор постов из VK через официальный VK API (vk_api) — без браузера.
-
-Для эффективности при большом числе групп и ключевых слов запросы
-батчатся через execute() — VK позволяет объединить до 25 вызовов метода
-в один HTTP-запрос (VKScript), это в разы быстрее и бережнее к лимитам,
-чем дёргать wall.search по одному на каждую пару группа+слово.
-
-Два режима, оба задаются в config.yaml -> vk:
-  1. group_ids — последние посты конкретных сообществ (wall.get, по 100 на
-     страницу), отбор по ключевым словам делается здесь же. Глубина —
-     vk.max_pages_per_query (по умолчанию 1 = последние 100 постов).
-     Посты старше vk.max_age_hours (по умолчанию 48 ч) отбрасываются.
-     Название группы резолвится один раз в начале (groups.getById) и
-     пишется в Lead.source_group — по нему потом строится статистика
-     (см. stats.py), какие паблики дают больше всего реальных заказов.
-  2. use_global_newsfeed_search — поиск по всей ленте VK (newsfeed.search),
-     требует токен с обычными пользовательскими правами, а не сервисный
-     токен сообщества.
-
-vk.group_overrides позволяет сканировать отдельные "горячие" группы
-активнее остальных (больше страниц на запрос), не трогая общий
-max_pages_per_query — см. пример в config.yaml. Обычно это заполняют по
-подсказке из stats.py, после того как накопилась статистика.
-
-Если пачка вызовов внутри execute() возвращает слишком большой суммарный
-ответ, VK отвечает ошибкой [13] "response size is too big" — повтор того
-же запроса не помогает, поэтому пачка автоматически делится пополам и
-обрабатывается рекурсивно (см. _execute_batch), а для одного слишком
-"тяжёлого" вызова используется прямой запрос в обход execute().
-"""
+"""VK pages, explicit execute sub-errors and durable per-source scan progress."""
 
 from __future__ import annotations
 
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-import vk_api
-from vk_api.exceptions import ApiError
+import requests
 
-from common import Lead, extract_phone, matches_keywords
+from common import Lead, ScanResult, extract_phone, keyword_decision, matches_keywords
+from security import safe_error
+from vk_client import VKClient, VKError
 
-EXECUTE_BATCH_SIZE = 25  # лимит VK на число вызовов в одном execute()
-
-
-def _post_to_lead(
-    post: dict,
-    keywords: list[str],
-    exclude: list[str] | None,
-    group_names: dict[int, str] | None = None,
-    min_ts: int | None = None,
-) -> Lead | None:
-    text = post.get("text", "")
-    if not text or not matches_keywords(text, keywords, exclude):
-        return None
-    # Старые посты (в т.ч. закреплённые) не нужны — иначе при первом запуске
-    # по новым группам заказчику улетели бы заявки месячной давности.
-    if min_ts and (post.get("date") or 0) < min_ts:
-        return None
-
-    owner_id = post.get("owner_id")
-    post_id = post.get("id")
-    url = f"https://vk.com/wall{owner_id}_{post_id}"
-    date_ts = post.get("date")
-    date_str = (
-        datetime.fromtimestamp(date_ts, tz=timezone.utc).isoformat() if date_ts else ""
-    )
-
-    source_group = ""
-    if owner_id and owner_id < 0 and group_names:
-        source_group = group_names.get(-owner_id, f"club{-owner_id}")
-
-    return Lead(
-        source="vk",
-        external_id=f"{owner_id}_{post_id}",
-        date=date_str,
-        author=str(post.get("signer_id", "") or owner_id or ""),
-        text=text,
-        phone=extract_phone(text) or "",
-        url=url,
-        source_group=source_group,
-    )
-
-
-_LINK_RE = re.compile(r"^(?:https?://)?(?:m\.)?vk\.(?:com|ru)/", re.IGNORECASE)
+EXECUTE_BATCH_SIZE = 25
+_LINK_RE = re.compile(r"^(?:https?://)?(?:m\.)?vk\.(?:com|ru)/", re.I)
 
 
 def _normalize_group_ref(ref) -> str:
-    """Приводит элемент vk.group_ids к виду, который понимает groups.getById:
-    123456 / -123456 / "club123456" / "public123456" / "https://vk.com/podslushano_samara"
-    / "podslushano_samara" -> "123456" или "podslushano_samara"."""
-    s = str(ref).strip()
-    s = _LINK_RE.sub("", s).split("?")[0].strip("/")
-    if s.lstrip("-").isdigit():
-        return str(abs(int(s)))
-    m = re.fullmatch(r"(?:club|public|event)(\d+)", s)
-    if m:
-        return m.group(1)
-    return s
+    value = _LINK_RE.sub("", str(ref).strip()).split("?")[0].split("#")[0].strip("/")
+    if value.lstrip("-").isdigit():
+        return str(abs(int(value)))
+    match = re.fullmatch(r"(?:club|public|event)(\d+)", value, re.I)
+    if match:
+        return match[1]
+    if not re.fullmatch(r"[A-Za-z0-9_.]+", value):
+        raise ValueError("Invalid VK group reference")
+    return value.casefold()
 
 
-def _resolve_groups(api, group_refs: list) -> tuple[list[int], dict[int, str]]:
-    """group_ids из конфига (числа, ссылки, короткие имена) -> ([id, ...], {id: название}).
-    Один запрос groups.getById на всё; если он падает (например, одна из
-    ссылок кривая), резолвим по одной, пропуская битые с предупреждением."""
-    refs = [_normalize_group_ref(r) for r in group_refs if str(r).strip()]
-    if not refs:
-        return [], {}
-
-    def _items(resp):
-        return resp.get("groups", resp) if isinstance(resp, dict) else resp
-
-    found: list[dict] = []
-    try:
-        found = list(_items(api.groups.getById(group_ids=",".join(refs))))
-    except ApiError as e:
-        print(f"[vk] groups.getById на весь список не прошёл ({e}) — резолвлю по одной.")
-        for ref in refs:
-            try:
-                found.extend(_items(api.groups.getById(group_ids=ref)))
-            except ApiError as e2:
-                print(f"[vk] Пропускаю группу {ref!r}: {e2}")
-            time.sleep(0.35)
-
-    ids: list[int] = []
-    names: dict[int, str] = {}
-    for g in found:
-        gid = int(g["id"])
-        if gid not in names:
-            ids.append(gid)
-            names[gid] = g.get("name", f"club{gid}")
-    if not found and refs:
-        # VK недоступен совсем — работаем хотя бы с числовыми id без названий.
-        ids = [int(r) for r in refs if r.isdigit()]
-    return ids, names
+def _resolve_groups(api, refs: list) -> tuple[list[int], dict[int, str]]:
+    names = {}
+    for ref in dict.fromkeys(_normalize_group_ref(ref) for ref in refs):
+        response = api.groups.getById(group_ids=ref)
+        items = response.get("groups", []) if isinstance(response, dict) else response
+        if not items:
+            raise VKError(100)
+        for group in items:
+            names[int(group["id"])] = group.get("name", "")
+    return list(names), names
 
 
-def _call_literal(method: str, params: dict) -> str:
-    """VKScript-вызов вида API.method({...}); VKScript понимает объект
-    параметров в виде обычного JSON-литерала."""
-    return f"API.{method}({json.dumps(params, ensure_ascii=False)})"
+def _post_to_lead(post, keywords, exclude, group_names=None, min_ts=None):
+    text = post.get("text", "")
+    if not matches_keywords(text, keywords, exclude) or (min_ts and post.get("date", 0) < min_ts):
+        return None
+    owner, post_id = post.get("owner_id"), post.get("id")
+    if not isinstance(owner, int) or not isinstance(post_id, int):
+        return None
+    stamp = post.get("date")
+    return Lead(
+        source="vk",
+        external_id=f"{owner}_{post_id}",
+        date=datetime.fromtimestamp(stamp, UTC).isoformat() if stamp else "",
+        author=str(post.get("signer_id") or owner),
+        text=text,
+        phone=extract_phone(text) or "",
+        url=f"https://vk.com/wall{owner}_{post_id}",
+        source_group=(group_names or {}).get(abs(owner), ""),
+        source_group_id=f"vk:{abs(owner)}" if owner < 0 else f"vk:user:{owner}",
+    )
 
 
-def _direct_call(api, method: str, params: dict):
-    """Вызов метода напрямую, в обход execute()/VKScript. Используется как
-    запасной вариант, когда даже ОДИН вызов внутри execute() не проходит
-    из-за ошибки VK [13] 'response size is too big' — это ограничение на
-    суммарный ответ именно execute(), к прямым вызовам метода оно не
-    применяется."""
-    obj = api
-    for part in method.split("."):
-        obj = getattr(obj, part)
-    return obj(**params)
-
-
-def _execute_batch(api, chunk: list[tuple[str, dict]], attempt: int = 0) -> list:
-    """chunk — список (метод, параметры). Выполняет их одним запросом
-    execute(). При обычной ошибке (лимит частоты и т.п.) — короткая пауза
-    и до двух повторов. При ошибке VK [13] 'response size is too big'
-    повтор того же запроса не поможет (тот же объём данных) — вместо этого
-    пачка делится пополам и обе половины обрабатываются рекурсивно; если
-    и один-единственный вызов оказывается слишком «тяжёлым» — он уходит
-    напрямую в обход execute() (см. _direct_call)."""
+def _execute_batch(client, chunk: list[tuple[str, dict]], attempt=0) -> list:
     if not chunk:
         return []
-
-    if len(chunk) == 1:
-        method, params = chunk[0]
-        code = "return [" + _call_literal(method, params) + "];"
-        try:
-            result = api.execute(code=code)
-            return list(result) if result else [None]
-        except ApiError as e:
-            if e.code == 13:
-                print(f"[vk] Слишком большой ответ на {method} — пробую напрямую, в обход execute()")
-                try:
-                    return [_direct_call(api, method, params)]
-                except ApiError as e2:
-                    print(f"[vk] Не получилось и напрямую ({method}): {e2}")
-                    return [None]
-            if attempt < 2:
-                time.sleep(1.5)
-                return _execute_batch(api, chunk, attempt=attempt + 1)
-            print(f"[vk] execute() не удался после повторов: {e}")
-            return [None]
-
-    code = "return [" + ",".join(_call_literal(m, p) for m, p in chunk) + "];"
+    code = (
+        "return ["
+        + ",".join(f"API.{method}({json.dumps(params, ensure_ascii=False)})" for method, params in chunk)
+        + "];"
+    )
     try:
-        result = api.execute(code=code)
-        result = list(result) if result else []
-        return result + [None] * (len(chunk) - len(result))
-    except ApiError as e:
-        if e.code == 13:
-            mid = len(chunk) // 2
-            time.sleep(0.3)
-            return _execute_batch(api, chunk[:mid]) + _execute_batch(api, chunk[mid:])
+        payload = client.method("execute", {"code": code}, raw=True)
+        response = payload.get("response")
+        if not isinstance(response, list) or len(response) != len(chunk):
+            raise VKError(0)
+        errors = iter(payload.get("execute_errors", []))
+        results = []
+        for index, result in enumerate(response):
+            if result is False or result is None:
+                error = VKError(int(next(errors, {}).get("error_code", 0)))
+                if not error.permanent and attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+                    result = _execute_batch(client, [chunk[index]], attempt + 1)[0]
+                else:
+                    result = error
+            results.append(result)
+        return results
+    except VKError as error:
+        if error.code == 13:
+            if len(chunk) > 1:
+                middle = len(chunk) // 2
+                return _execute_batch(client, chunk[:middle], attempt) + _execute_batch(
+                    client, chunk[middle:], attempt
+                )
+            try:
+                return [client.method(*chunk[0])]
+            except (VKError, requests.RequestException) as direct_error:
+                return [direct_error]
+        if not error.permanent and attempt < 2:
+            time.sleep(0.35 * (attempt + 1))
+            return _execute_batch(client, chunk, attempt + 1)
+        return [error] * len(chunk)
+    except (requests.RequestException, ValueError) as error:
         if attempt < 2:
-            time.sleep(1.5)
-            return _execute_batch(api, chunk, attempt=attempt + 1)
-        print(f"[vk] execute() не удался после повторов: {e}")
-        return [None] * len(chunk)
+            time.sleep(0.35 * (attempt + 1))
+            return _execute_batch(client, chunk, attempt + 1)
+        return [error] * len(chunk)
 
 
-def _run_batched(api, tasks: list[tuple[str, dict]]) -> list:
-    """tasks — список (метод, параметры). Возвращает результаты в том же
-    порядке, разбивая на чанки по EXECUTE_BATCH_SIZE с паузой между ними."""
-    results: list = []
-    for start in range(0, len(tasks), EXECUTE_BATCH_SIZE):
-        chunk = tasks[start:start + EXECUTE_BATCH_SIZE]
-        chunk_results = _execute_batch(api, chunk)
-        # Если VK молча вернул меньше элементов, чем запрашивали — не рассыпаемся.
-        chunk_results = list(chunk_results) + [None] * (len(chunk) - len(chunk_results))
-        results.extend(chunk_results)
-        time.sleep(0.5)  # execute тоже подчиняется общему лимиту ~3 запроса/сек
-    return results
+def _run_batched(client, tasks):
+    return [
+        result
+        for start in range(0, len(tasks), EXECUTE_BATCH_SIZE)
+        for result in _execute_batch(client, tasks[start : start + EXECUTE_BATCH_SIZE])
+    ]
 
 
-def collect_leads(cfg: dict) -> list[Lead]:
-    vk_cfg = cfg["vk"]
-    if not vk_cfg.get("enabled", True):
-        return []
-
-    general = cfg["general"]
-    keywords = general["keywords"]
-    exclude = general.get("exclude_keywords")
-
-    session = vk_api.VkApi(token=vk_cfg["access_token"], api_version=vk_cfg.get("api_version", "5.199"))
-    api = session.get_api()
-
-    group_ids = vk_cfg.get("group_ids") or []
-    if not group_ids and not vk_cfg.get("use_global_newsfeed_search"):
-        print("[vk] Список group_ids пуст и глобальный поиск выключен — нечего парсить.")
-        return []
-
-    count = min(vk_cfg.get("posts_per_run", 100), 100)
-    max_pages = max(1, vk_cfg.get("max_pages_per_query", 1))
-    overrides = vk_cfg.get("group_overrides") or {}
-    max_age_hours = vk_cfg.get("max_age_hours", 48)
-    min_ts = int(time.time() - max_age_hours * 3600) if max_age_hours else None
-
-    leads: list[Lead] = []
-    group_names: dict[int, str] = {}
-
-    if group_ids:
-        resolved_ids, group_names = _resolve_groups(api, group_ids)
-
-        # Берём последние посты каждой группы целиком (wall.get) и отбираем
-        # по ключевым словам сами. Раньше здесь был wall.search по каждому
-        # слову, но токены VK ID (сервер) получают на нём ошибку 1051
-        # "Method is not available for this profile type" — а VK внутри
-        # execute() такую ошибку молча превращает в пустой ответ, и парсер
-        # просто "ничего не находил". wall.get работает с любым токеном,
-        # запросов меньше (по одному на группу, а не группа×слово) и свежие
-        # посты не теряются.
-        tasks: list[tuple[str, dict]] = []
-        for gid in resolved_ids:
-            # "Горячие" группы можно сканировать глубже остальных — см.
-            # vk.group_overrides в config.yaml.
-            pages_for_group = max(1, overrides.get(gid, {}).get("max_pages", max_pages))
-            for page in range(pages_for_group):
-                tasks.append((
-                    "wall.get",
-                    {"owner_id": -gid, "count": count, "offset": page * count, "extended": 0},
-                ))
-        n_requests = (len(tasks) + EXECUTE_BATCH_SIZE - 1) // EXECUTE_BATCH_SIZE
-        print(f"[vk] {len(resolved_ids)} групп, {len(tasks)} вызовов wall.get — {n_requests} запрос(ов) execute()...")
-        results = _run_batched(api, tasks)
-        failed = sum(1 for res in results if not res)
-        if failed:
-            print(f"[vk] Внимание: {failed} из {len(tasks)} вызовов wall.get вернули ошибку/пусто "
-                  "(закрытая группа, бан, или метод недоступен для токена).")
-        scanned = 0
-        for res in results:
-            if not res:
-                continue
-            for post in res.get("items", []):
-                scanned += 1
-                lead = _post_to_lead(post, keywords, exclude, group_names, min_ts)
+def _scan_group(client, gid, names, cfg, store, reports):
+    settings = cfg["vk"]
+    result = ScanResult(f"vk:{gid}")
+    previous = store.cursor(result.source_id) if store else {}
+    override = settings["group_overrides"].get(str(gid), settings["group_overrides"].get(gid, {}))
+    budget = override.get("max_pages", settings["max_pages_per_query"])
+    count = min(settings["posts_per_run"], 100)
+    started = previous.get("started", time.time()) if previous.get("offset") else time.time()
+    cutoff = (
+        previous.get("cutoff")
+        if previous.get("offset")
+        else previous.get(
+            "watermark", started - settings["max_age_hours"] * 3600 if settings["max_age_hours"] else 0
+        )
+        - settings["overlap_seconds"]
+    )
+    offset, new_anchor, anchor_index = 0, None, 0
+    leads = []
+    result.complete = False
+    try:
+        if previous.get("offset"):
+            front = _execute_batch(client, [("wall.get", {"owner_id": -gid, "count": count, "offset": 0})])[0]
+            if isinstance(front, Exception):
+                raise front
+            front_items = front["items"]
+            front_leads = [
+                lead
+                for post in front_items
+                if (
+                    lead := _post_to_lead(
+                        post, cfg["general"]["keywords"], cfg["general"]["exclude_keywords"], names, cutoff
+                    )
+                )
+            ]
+            if store:
+                store.ingest(front_leads)
+            leads.extend(front_leads)
+            result.scanned += len(front_items)
+            result.candidates += len(front_leads)
+            for index, post in enumerate(front_items):
+                if not post.get("is_pinned") and new_anchor is None:
+                    new_anchor, anchor_index = post["id"], index
+                if post.get("id") == previous.get("anchor"):
+                    offset = max(0, previous["offset"] + index - previous.get("anchor_index", 0))
+            # If the anchor disappeared/shifted past the front page, rescan from zero,
+            # retain the original cutoff, and anchor the next continuation to this front.
+        for _ in range(budget):
+            response = _execute_batch(
+                client, [("wall.get", {"owner_id": -gid, "count": count, "offset": offset})]
+            )[0]
+            if isinstance(response, Exception):
+                raise response
+            if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+                raise VKError(0)
+            items = response["items"]
+            ordinary = [post for post in items if not post.get("is_pinned")]
+            if new_anchor is None and ordinary:
+                new_anchor = ordinary[0]["id"]
+                anchor_index = items.index(ordinary[0])
+            page = []
+            for post in items:
+                result.counted(
+                    "outside_window"
+                    if post.get("date", 0) < cutoff
+                    else keyword_decision(
+                        post.get("text", ""), cfg["general"]["keywords"], cfg["general"]["exclude_keywords"]
+                    )[1]
+                )
+                lead = _post_to_lead(
+                    post, cfg["general"]["keywords"], cfg["general"]["exclude_keywords"], names, cutoff
+                )
                 if lead:
-                    leads.append(lead)
-        print(f"[vk] Просмотрено постов: {scanned}, подошло по ключевым словам и давности (≤{max_age_hours} ч): {len(leads)}.")
+                    lead.extra["known_city"] = cfg["general"]["city"]
+                    page.append(lead)
+            result.scanned += len(items)
+            result.candidates += len(page)
+            leads.extend(page)
+            if store:
+                store.ingest(page)
+            finished = (
+                not items
+                or len(items) < count
+                or bool(ordinary and all(post.get("date", 0) < cutoff for post in ordinary))
+            )
+            next_offset = offset + len(items)
+            result.cursor = (
+                {"watermark": started}
+                if finished
+                else {
+                    "offset": next_offset,
+                    "anchor": new_anchor,
+                    "anchor_index": anchor_index,
+                    "cutoff": cutoff,
+                    "started": started,
+                }
+            )
+            if store:
+                store.checkpoint(result)
+            if finished:
+                result.complete = True
+                break
+            offset = next_offset
+        if not result.complete:
+            result.errors.append("BudgetExhausted: backlog retained")
+    except Exception as error:
+        result.fail(f"VK:{error.code}" if isinstance(error, VKError) else safe_error(error))
+        if not result.cursor:
+            result.cursor = previous
+    if store:
+        store.checkpoint(result)
+    reports.append(result)
+    return leads
 
-    if vk_cfg.get("use_global_newsfeed_search"):
-        # Глобальный поиск по ленте (посты с личных страниц и из любых
-        # групп) токену VK ID недоступен (ошибка 1051). Если в конфиге есть
-        # vk.search_token — полноценный пользовательский токен (например,
-        # через vkhost) — поиск идёт им, а чтение стен групп остаётся на
-        # основном (самообновляющемся) токене.
-        search_token = str(vk_cfg.get("search_token") or "").strip()
-        search_api = api
-        if search_token and "ВСТАВЬТЕ" not in search_token.upper():
-            search_api = vk_api.VkApi(token=search_token, api_version=vk_cfg.get("api_version", "5.199")).get_api()
-        city = general.get("city", "")
-        newsfeed_count = min(vk_cfg.get("posts_per_run", 100), 200)
-        tasks = [
-            ("newsfeed.search", {"q": f"{kw} {city}".strip(), "count": newsfeed_count, "extended": 0})
-            for kw in keywords
-        ]
-        results = _run_batched(search_api, tasks)
-        failed = sum(1 for res in results if not res)
-        if failed == len(tasks):
-            print("[vk] Глобальный поиск (newsfeed.search) не сработал ни по одному слову — "
-                  "токен не подходит или истёк (нужен vk.search_token с полными правами).")
-        found = 0
-        for res in results:
-            if not res:
-                continue
-            for post in res.get("items", []):
-                lead = _post_to_lead(post, keywords, exclude, min_ts=min_ts)
-                if lead:
-                    leads.append(lead)
-                    found += 1
-        print(f"[vk] Глобальный поиск: подошло по ключевым словам и давности: {found}.")
 
+def collect_leads(cfg, store=None, reports=None, client=None):
+    reports = reports if reports is not None else []
+    settings = cfg["vk"]
+    if not settings["enabled"]:
+        return []
+    client = client or VKClient(
+        settings["access_token"], settings["api_version"], settings["request_timeout_seconds"]
+    )
+    leads = []
+    for ref in settings["group_ids"]:
+        try:
+            ids, names = _resolve_groups(client.get_api(), [ref])
+            for gid in ids:
+                leads.extend(_scan_group(client, gid, names, cfg, store, reports))
+        except Exception as error:
+            result = ScanResult("vk:ref:" + _normalize_group_ref(ref))
+            result.fail(f"VK:{error.code}" if isinstance(error, VKError) else safe_error(error))
+            reports.append(result)
+            if store:
+                store.checkpoint(result)
+    if settings["use_global_newsfeed_search"]:
+        search = (
+            VKClient(settings["search_token"], settings["api_version"], settings["request_timeout_seconds"])
+            if settings["search_token"]
+            else client
+        )
+        for keyword in cfg["general"]["keywords"]:
+            result = ScanResult("vk:search:" + keyword)
+            previous = store.cursor(result.source_id) if store else {}
+            params = {
+                "q": keyword + " " + cfg["general"]["city"],
+                "count": min(settings["posts_per_run"], 200),
+                "start_time": previous.get("start_time", int(time.time() - settings["max_age_hours"] * 3600)),
+            }
+            if previous.get("next_from"):
+                params["start_from"] = previous["next_from"]
+            try:
+                for _ in range(settings["max_pages_per_query"]):
+                    response = _execute_batch(search, [("newsfeed.search", params)])[0]
+                    if isinstance(response, Exception):
+                        raise response
+                    page = [
+                        lead
+                        for post in response["items"]
+                        if (
+                            lead := _post_to_lead(
+                                post,
+                                cfg["general"]["keywords"],
+                                cfg["general"]["exclude_keywords"],
+                                min_ts=params["start_time"],
+                            )
+                        )
+                    ]
+                    leads.extend(page)
+                    result.scanned += len(response["items"])
+                    result.candidates += len(page)
+                    if store:
+                        store.ingest(page)
+                    following = response.get("next_from")
+                    result.cursor = (
+                        {"next_from": following, "start_time": params["start_time"]} if following else {}
+                    )
+                    result.complete = not bool(following)
+                    if store:
+                        store.checkpoint(result)
+                    if result.complete:
+                        break
+                    if following == params.get("start_from"):
+                        raise VKError(0)
+                    params["start_from"] = following
+            except Exception as error:
+                result.fail(f"VK:{error.code}" if isinstance(error, VKError) else safe_error(error))
+                if not result.cursor:
+                    result.cursor = previous
+            if not result.complete and not result.errors:
+                result.errors.append("BudgetExhausted: search coverage is best effort")
+            reports.append(result)
+            if store:
+                store.checkpoint(result)
     return leads

@@ -1,0 +1,23 @@
+{
+  "dataset_version": "synthetic-v1",
+  "dataset_size": 30,
+  "mode": "offline-prefilter",
+  "prompt_version": "client-request-v2",
+  "prefilter": {
+    "confusion_matrix": {
+      "tp": 14,
+      "fp": 11,
+      "fn": 0,
+      "tn": 5
+    },
+    "precision": 0.56,
+    "recall": 1.0,
+    "reasons": {
+      "configured_phrase": 11,
+      "request_and_topic": 14,
+      "no_request_or_keyword": 5
+    },
+    "candidates": 25
+  },
+  "missed_before_ai": []
+}

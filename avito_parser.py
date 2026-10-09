@@ -1,191 +1,259 @@
-"""Парсинг объявлений Avito через Playwright.
-
-Avito активно борется со скрапингом (капчи, блокировки по паттерну
-поведения/IP), поэтому в отличие от telegram_parser.py и vk_parser.py
-(официальные API) здесь используется управление браузером.
-
-Если объявления не грузятся / Avito показывает капчу — используйте
-антидетект-браузер Dolphin{anty}. Два варианта подключения, оба задаются
-в config.yaml -> avito:
-
-1. Автоматически (рекомендуется) — avito.dolphin.enabled: true +
-   avito.dolphin.profile_id. Скрипт сам запускает нужный профиль через
-   Dolphin{anty} Local API (http://127.0.0.1:3001) перед каждым прогоном
-   и сам его останавливает после. Порт для CDP каждый раз выдаётся заново
-   Dolphin'ом — скрипт сам его подставляет, вручную ничего копировать не
-   нужно. Требуется, чтобы приложение Dolphin{anty} было запущено и вы
-   были в нём залогинены.
-2. Вручную — avito.cdp_endpoint: если у вас уже открыт профиль с
-   известным CDP-адресом (например "http://127.0.0.1:PORT" из ответа
-   Dolphin Local API), впишите его напрямую. Имеет смысл, если хотите
-   сами управлять запуском/остановкой профиля.
-
-Если ни то, ни другое не задано — просто запускается обычный headless
-Chromium через Playwright (без антидетекта).
-
-ВАЖНО: селекторы карточек объявлений (data-marker=...) видны в актуальной
-вёрстке Avito на момент написания скрипта, но сайт меняет их без
-предупреждения. Если парсер вернёт 0 объявлений при рабочем интернете —
-скорее всего, поменялась вёрстка: откройте страницу поиска руками,
-посмотрите атрибуты карточек через "Просмотреть код" и поправьте
-SELECTORS ниже.
-"""
+"""Avito public detail extraction with explicit resource ownership and diagnostics."""
 
 from __future__ import annotations
 
 import re
-import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
+from playwright.sync_api import TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
 
-from common import Lead, matches_keywords
+from common import Lead, ScanResult, extract_phone, matches_keywords
+from security import safe_error
 
 SELECTORS = {
     "card": '[data-marker="item"]',
     "title": '[itemprop="name"]',
     "price": '[data-marker="item-price"]',
     "link": 'a[data-marker="item-title"]',
+    "description": '[data-marker="item-view/item-description"], [itemprop="description"]',
+    "published": 'time[datetime], meta[itemprop="datePosted"]',
 }
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
+
+class SourceError(RuntimeError):
+    """A fixed diagnostic code, never remote response text."""
 
 
-def _build_url(city_slug: str, query: str) -> str:
-    base = f"https://www.avito.ru/{city_slug}"
-    params = urllib.parse.urlencode({"q": query})
-    return f"{base}?{params}"
+def _build_url(city_slug, query):
+    return f"https://www.avito.ru/{city_slug}?" + urlencode({"q": query})
 
 
-def _extract_id_from_link(href: str) -> str:
-    match = re.search(r"_(\d+)(?:\?|$)", href)
-    return match.group(1) if match else href
+def canonical_url(href):
+    if not href:
+        raise ValueError("Missing listing URL")
+    parts = urlsplit(urljoin("https://www.avito.ru", href))
+    if parts.hostname not in {"avito.ru", "www.avito.ru"} or parts.scheme not in {"http", "https"}:
+        raise ValueError("Invalid listing origin")
+    return urlunsplit(("https", "www.avito.ru", parts.path.rstrip("/"), "", ""))
 
 
-def _dolphin_base_url(dolphin_cfg: dict) -> str:
-    return dolphin_cfg.get("local_api_url", "http://127.0.0.1:3001").rstrip("/")
+def _extract_id_from_link(href):
+    url = canonical_url(href)
+    match = re.search(r"_(\d+)$", urlsplit(url).path)
+    if not match:
+        raise ValueError("Missing Avito listing ID")
+    return match[1]
 
 
-def _start_dolphin_profile(dolphin_cfg: dict) -> str:
-    """Запускает профиль Dolphin{anty} через Local API и возвращает CDP-адрес
-    вида http://127.0.0.1:PORT (порт каждый раз новый, выдаёт сам Dolphin)."""
-    base = _dolphin_base_url(dolphin_cfg)
-    profile_id = dolphin_cfg["profile_id"]
-    resp = requests.get(
-        f"{base}/v1.0/browser_profiles/{profile_id}/start",
+def _start_dolphin_profile(settings):
+    response = requests.get(
+        settings["local_api_url"].rstrip("/") + f"/v1.0/browser_profiles/{settings['profile_id']}/start",
         params={"automation": 1},
-        timeout=30,
+        timeout=(5, 30),
     )
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Dolphin{{anty}} Local API отказал при запуске профиля {profile_id}: {data}")
-    port = data["automation"]["port"]
-    return f"http://127.0.0.1:{port}"
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("success") is not True:
+        raise RuntimeError("DolphinStartFailed")
+    return f"http://127.0.0.1:{int(payload['automation']['port'])}"
 
 
-def _stop_dolphin_profile(dolphin_cfg: dict) -> None:
-    base = _dolphin_base_url(dolphin_cfg)
-    profile_id = dolphin_cfg["profile_id"]
+def _stop_dolphin_profile(settings):
+    response = requests.get(
+        settings["local_api_url"].rstrip("/") + f"/v1.0/browser_profiles/{settings['profile_id']}/stop",
+        timeout=(5, 10),
+    )
+    response.raise_for_status()
+    if response.json().get("success") is not True:
+        raise RuntimeError("DolphinStopFailed")
+
+
+class BrowserResources:
+    def __init__(self, pw, settings):
+        self.pw, self.settings = pw, settings
+        self.browser = self.context = None
+        self.owns_browser = self.owns_context = self.dolphin_started = False
+        self.pages = []
+
+    def open(self):
+        endpoint = self.settings["cdp_endpoint"]
+        dolphin = self.settings["dolphin"]
+        if dolphin["enabled"]:
+            # Stop is attempted even if the start request succeeded remotely but its response was lost.
+            self.dolphin_started = True
+            endpoint = _start_dolphin_profile(dolphin)
+        if endpoint:
+            self.browser = self.pw.chromium.connect_over_cdp(
+                endpoint, timeout=self.settings["request_timeout_seconds"] * 1000
+            )
+            if self.browser.contexts:
+                self.context = self.browser.contexts[0]
+            else:
+                self.context = self.browser.new_context()
+                self.owns_context = True
+        else:
+            self.browser = self.pw.chromium.launch(headless=self.settings["headless"])
+            self.owns_browser = True
+            self.context = self.browser.new_context(locale="ru-RU")
+            self.owns_context = True
+        return self
+
+    def page(self):
+        page = self.context.new_page()
+        page.set_default_timeout(self.settings["request_timeout_seconds"] * 1000)
+        self.pages.append(page)
+        return page
+
+    def close(self) -> list[str]:
+        errors = []
+        actions = [("page", page.close) for page in self.pages]
+        if self.owns_context and self.context:
+            actions.append(("context", self.context.close))
+        if self.owns_browser and self.browser:
+            actions.append(("browser", self.browser.close))
+        if self.dolphin_started:
+            actions.append(("dolphin", lambda: _stop_dolphin_profile(self.settings["dolphin"])))
+        for name, action in actions:
+            try:
+                action()
+            except Exception as error:
+                errors.append(f"Cleanup:{name}:{safe_error(error)}")
+        return errors
+
+
+def _text(element):
+    return element.inner_text().strip() if element else ""
+
+
+def _page_status(page, response, *, listing=False):
+    if response is None:
+        raise SourceError("MissingHTTPResponse")
+    if response.status in {403, 429} or page.query_selector('[data-marker="captcha"], #captcha, .captcha'):
+        raise SourceError("SourceBlocked")
+    if response.status >= 400:
+        raise SourceError(f"HTTP:{response.status}")
+    if listing and not page.query_selector(SELECTORS["description"]):
+        raise SourceError("DetailLayoutChanged")
+
+
+def _wait_content(page, selector, diagnostic):
     try:
-        requests.get(f"{base}/v1.0/browser_profiles/{profile_id}/stop", timeout=10)
-    except requests.RequestException:
-        pass  # не критично — профиль просто останется открытым, ничего не сломается
+        page.wait_for_selector(selector + ', [data-marker="captcha"], #captcha, .captcha', state="attached")
+    except BrowserTimeout as error:
+        raise SourceError(diagnostic) from error
 
 
-def _get_browser(pw, avito_cfg: dict):
-    dolphin_cfg = avito_cfg.get("dolphin") or {}
-    if dolphin_cfg.get("enabled"):
-        cdp = _start_dolphin_profile(dolphin_cfg)
-        print(f"[avito] Подключаюсь к профилю Dolphin{{anty}} ({cdp})")
-        browser = pw.chromium.connect_over_cdp(cdp)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        return browser, context
+def _listing(card, detail, cfg):
+    link = card.query_selector(SELECTORS["link"])
+    title = _text(card.query_selector(SELECTORS["title"]))
+    url = canonical_url(link.get_attribute("href") if link else "")
+    identity = _extract_id_from_link(url)
+    response = detail.goto(
+        url, wait_until="domcontentloaded", timeout=cfg["avito"]["request_timeout_seconds"] * 1000
+    )
+    _page_status(detail, response)
+    _wait_content(detail, SELECTORS["description"], "DetailLayoutChangedOrTimedOut")
+    _page_status(detail, response, listing=True)
+    text = title + "\n\n" + _text(detail.query_selector(SELECTORS["description"]))
+    if not matches_keywords(text, cfg["general"]["keywords"], cfg["general"]["exclude_keywords"]):
+        return None
+    published = detail.query_selector(SELECTORS["published"])
+    raw_date = (
+        (published.get_attribute("datetime") or published.get_attribute("content")) if published else None
+    )
+    date = ""
+    if raw_date:
+        try:
+            value = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            date = value.isoformat()
+        except ValueError:
+            pass
+    return Lead(
+        source="avito",
+        external_id=identity,
+        date=date,
+        text=text,
+        url=url,
+        price=_text(card.query_selector(SELECTORS["price"])),
+        phone=extract_phone(text) or "",
+        source_group="Avito " + cfg["general"]["city"],
+        source_group_id="avito:" + cfg["avito"]["city_slug"],
+        extra={"title": title, "publication_date_known": bool(date), "known_city": cfg["general"]["city"]},
+    )
 
-    cdp = avito_cfg.get("cdp_endpoint")
-    if cdp:
-        browser = pw.chromium.connect_over_cdp(cdp)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        return browser, context
 
-    browser = pw.chromium.launch(headless=avito_cfg.get("headless", True))
-    context = browser.new_context(user_agent=USER_AGENT, locale="ru-RU")
-    return browser, context
-
-
-def collect_leads(cfg: dict) -> list[Lead]:
-    avito_cfg = cfg["avito"]
-    if not avito_cfg.get("enabled", True):
+def collect_leads(cfg, store=None, reports=None):
+    reports = reports if reports is not None else []
+    settings = cfg["avito"]
+    if not settings["enabled"]:
         return []
-
-    general = cfg["general"]
-    keywords = general["keywords"]
-    exclude = general.get("exclude_keywords")
-    city_slug = avito_cfg.get("city_slug", "samara")
-    max_items = avito_cfg.get("max_listings_per_query", 50)
-    dolphin_cfg = avito_cfg.get("dolphin") or {}
-
-    leads: list[Lead] = []
-
+    leads = []
+    cleanup_errors = []
     with sync_playwright() as pw:
+        resources = BrowserResources(pw, settings)
         try:
-            browser, context = _get_browser(pw, avito_cfg)
-        except requests.exceptions.ConnectionError:
-            print(f"[avito] Не достучаться до Dolphin{{anty}} Local API ({_dolphin_base_url(dolphin_cfg)}).")
-            print("[avito] Проверьте, что приложение Dolphin{anty} запущено и вы вошли в аккаунт.")
-            return []
-        except Exception as e:
-            print(f"[avito] Не удалось запустить/подключиться к браузеру: {e}")
-            return []
-
-        try:
-            page = context.new_page()
-
-            for query in avito_cfg.get("search_queries", []):
-                url = _build_url(city_slug, query)
+            resources.open()
+            page, detail = resources.page(), resources.page()
+            for query in settings["search_queries"]:
+                result = ScanResult("avito:search:" + settings["city_slug"] + ":" + query)
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_selector(SELECTORS["card"], timeout=15000)
-                except Exception as e:
-                    print(f"[avito] Не удалось загрузить выдачу по запросу '{query}': {e}")
-                    print("[avito] Возможно, Avito показал капчу — попробуйте включить avito.dolphin в конфиге.")
-                    continue
-
-                cards = page.query_selector_all(SELECTORS["card"])
-                for card in cards[:max_items]:
-                    title_el = card.query_selector(SELECTORS["title"])
-                    price_el = card.query_selector(SELECTORS["price"])
-                    link_el = card.query_selector(SELECTORS["link"])
-                    if not title_el or not link_el:
-                        continue
-
-                    title = title_el.inner_text().strip()
-                    if not matches_keywords(title, keywords, exclude):
-                        continue
-
-                    href = link_el.get_attribute("href") or ""
-                    full_url = href if href.startswith("http") else f"https://www.avito.ru{href}"
-                    price = price_el.inner_text().strip() if price_el else ""
-
-                    leads.append(
-                        Lead(
-                            source="avito",
-                            external_id=_extract_id_from_link(href),
-                            date=datetime.now(timezone.utc).isoformat(),
-                            author="",
-                            text=title,
-                            phone="",
-                            price=price,
-                            url=full_url,
-                        )
+                    response = page.goto(
+                        _build_url(settings["city_slug"], query),
+                        wait_until="domcontentloaded",
+                        timeout=settings["request_timeout_seconds"] * 1000,
                     )
+                    _page_status(page, response)
+                    _wait_content(
+                        page,
+                        SELECTORS["card"] + ', [data-marker="search-results/no-results"]',
+                        "SearchLayoutChangedOrTimedOut",
+                    )
+                    _page_status(page, response)
+                    cards = page.query_selector_all(SELECTORS["card"])
+                    if not cards and not page.query_selector('[data-marker="search-results/no-results"]'):
+                        raise SourceError("SearchLayoutChangedOrUnrecognizedBlock")
+                    if not cards:
+                        result.counted("empty_results")
+                    limit = min(settings["max_listings_per_query"], settings["detail_limit"])
+                    if len(cards) > limit:
+                        result.fail("BudgetExhausted: listing coverage is best effort")
+                    for card in cards[:limit]:
+                        result.scanned += 1
+                        try:
+                            lead = _listing(card, detail, cfg)
+                            if lead:
+                                result.counted("candidate")
+                                leads.append(lead)
+                                result.candidates += 1
+                                if store:
+                                    store.ingest([lead])
+                            else:
+                                result.counted("prefilter_rejected")
+                        except Exception as error:
+                            result.fail(str(error) if isinstance(error, SourceError) else safe_error(error))
+                        if store:
+                            store.checkpoint(result)
+                except Exception as error:
+                    result.fail(str(error) if isinstance(error, SourceError) else safe_error(error))
+                reports.append(result)
+                if store:
+                    store.checkpoint(result)
+        except Exception as error:
+            result = ScanResult("avito:browser")
+            result.fail(str(error) if isinstance(error, SourceError) else safe_error(error))
+            reports.append(result)
+            if store:
+                store.checkpoint(result)
         finally:
-            context.close()
-            browser.close()
-            if dolphin_cfg.get("enabled"):
-                _stop_dolphin_profile(dolphin_cfg)
-
+            cleanup_errors = resources.close()
+    if cleanup_errors:
+        result = ScanResult("avito:cleanup")
+        for error in cleanup_errors:
+            result.fail(error)
+        reports.append(result)
+        if store:
+            store.checkpoint(result)
     return leads

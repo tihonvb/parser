@@ -1,37 +1,31 @@
-"""Простое JSON-хранилище уже отправленных лидов, чтобы не дублировать строки
-в таблице при повторных (в т.ч. по расписанию) запусках."""
+"""Compatibility adapter; new application code uses storage.Store directly."""
 
-from __future__ import annotations
-
-import json
 from pathlib import Path
+
+from storage import Store
 
 
 class SeenStore:
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self._seen: set[str] = set()
-        self._load()
+    def __init__(self, path):
+        path = Path(path)
+        self.store = Store(path.with_suffix(".sqlite3") if path.suffix == ".json" else path)
+        if path.suffix == ".json":
+            self.store.import_legacy(path)
 
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                self._seen = set(data.get("seen", []))
-            except (json.JSONDecodeError, OSError):
-                self._seen = set()
-
-    def is_new(self, key: str) -> bool:
-        return key not in self._seen
-
-    def mark(self, key: str) -> None:
-        self._seen.add(key)
-
-    def save(self) -> None:
-        # Не храним стор бесконечно — ограничиваем последними ~20000 ключами,
-        # чтобы файл не рос вечно при долгой работе по расписанию.
-        keys = list(self._seen)[-20000:]
-        self.path.write_text(
-            json.dumps({"seen": keys}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+    def is_new(self, key):
+        return (
+            not self.store.db.execute("SELECT 1 FROM legacy_seen WHERE key=?", (key,)).fetchone()
+            and not self.store.db.execute(
+                "SELECT 1 FROM leads WHERE key=? AND ai_state IN ('accepted','rejected')", (key,)
+            ).fetchone()
         )
+
+    def mark(self, key):
+        self.store.db.execute("INSERT OR IGNORE INTO legacy_seen VALUES (?)", (key,))
+
+    def save(self):
+        # Writes are already transactional; there is no lossy set truncation.
+        pass
+
+    def close(self):
+        self.store.close()

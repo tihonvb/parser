@@ -1,0 +1,3 @@
+# Absolute interpreter/config paths; process lock is implemented by main.py.
+# Paths in config.yaml must point to writable private state, session and token files.
+0 * * * * cd /opt/parser && /opt/parser/.venv/bin/python /opt/parser/main.py --config /var/lib/parser/config.yaml >> /var/lib/parser/parser.log 2>&1

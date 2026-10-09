@@ -1,148 +1,93 @@
-# =========================================================================
-# Конфигурация парсера лидов "ремонт под ключ" по Самаре
-# =========================================================================
-# Заполните разделы ниже своими данными. Пустые списки (channels, groups)
-# нужно дополнить перед первым запуском — без источников парсить нечего.
-
+# Все интеграции выключены. Включайте только настроенные источники.
+# Относительные пути разрешаются от каталога этого YAML. Секреты — в .env.
 general:
-  city: "Самара"
-  # Ключевые слова, по которым ищем посты/объявления. Регистр не важен.
+  city: Самара
+  work_type: ремонт квартир под ключ
   keywords:
-    - "ремонт под ключ"
-    - "ремонт квартир под ключ"
-    - "капитальный ремонт под ключ"
-    - "ремонт квартиры под ключ"
-    - "сделаем ремонт"
-    - "нужен ремонт"
-    - "ищу бригаду"
-    - "ищем бригаду"
-    - "нужна бригада"
-  # Если хотя бы одно слово из "exclude_keywords" встречается в тексте —
-  # лид пропускается (отсекаем, например, чужие города или рекламу курсов).
-  exclude_keywords:
-    - "курс по ремонту"
-    - "обучение ремонту"
-
+  - нужен ремонт
+  - ищу бригаду
+  exclude_keywords: []
 telegram:
-  # Пока не получены api_id/api_hash (сейчас my.telegram.org отдаёт ошибку,
-  # см. README) — выключено, чтобы main.py спокойно работал по VK и Avito.
-  # Как получите ключи — поставьте true.
   enabled: false
-  # api_id / api_hash получаются на https://my.telegram.org (см. README).
-  api_id: "PUT_YOUR_API_ID"
-  api_hash: "PUT_YOUR_API_HASH"
-  # Имя файла сессии Telethon — создастся автоматически при первом запуске
-  # (там же придётся один раз ввести код подтверждения из Telegram).
-  session_name: "remont_parser_session"
-  # Список каналов/групп для мониторинга: @username или ссылка t.me/...
-  # СПИСОК ПУСТОЙ — заполните перед запуском (см. README, раздел "Где взять каналы").
+  api_id: ''
+  api_hash: ''
+  session_name: .data/telegram
   channels: []
-  # Сколько последних сообщений проверять за один прогон в каждом канале.
   messages_per_run: 200
-  # Искать только за последние N часов (защита от повторной обработки старого).
   lookback_hours: 48
-  # Сколько каналов обрабатывать одновременно (параллельно). Больше — быстрее
-  # при большом списке каналов, но выше риск флуд-контроля Telegram. 5 — разумный старт.
   max_concurrent_channels: 5
-  # Точечные настройки для отдельных "горячих" каналов — сканировать их
-  # активнее остальных (больше сообщений за прогон и/или глубже lookback_hours),
-  # не трогая общие messages_per_run/lookback_hours выше. Ключ — тот же
-  # username/id, что указан в channels. Заполняется по подсказке stats.py
-  # (запустите `python stats.py`, когда накопится статистика) — пример:
-  #   channel_overrides:
-  #     "@remont_samara_chat":
-  #       messages_per_run: 400
-  #       lookback_hours: 72
+  max_messages_per_channel: 5000
+  channel_timeout_seconds: 180
   channel_overrides: {}
-
 vk:
-  enabled: true
-  # Токен пользователя/сервисный токен с правами wall, groups, offline.
-  # Получается через https://vkhost.github.io/ или создание Standalone-приложения.
-  access_token: "PUT_YOUR_VK_TOKEN"
-  api_version: "5.199"
-  # ID групп (числом, без минуса) для точечного поиска через wall.search.
-  # СПИСОК ПУСТОЙ — заполните перед запуском.
+  enabled: false
+  access_token: ''
+  token_mode: static
+  token_file: vk_tokens.json
+  state_file: vk_pkce_state.json
+  client_id: '54797818'
+  redirect_uri: https://oauth.vk.ru/blank.html
+  api_version: '5.199'
   group_ids: []
-  # Если true — дополнительно ищет по всей ленте VK (newsfeed.search),
-  # не только в указанных группах. Требует токена с обычными правами
-  # пользователя (не сервисный токен сообщества).
+  search_token: ''
   use_global_newsfeed_search: false
   posts_per_run: 100
-  # Сколько страниц (по posts_per_run постов) забирать на каждую комбинацию
-  # группа+ключевое слово. 1 = только самые свежие/релевантные совпадения.
-  max_pages_per_query: 1
-  # Точечные настройки для отдельных "горячих" групп — сканировать их
-  # активнее остальных (больше страниц на запрос), не трогая общий
-  # max_pages_per_query выше. Ключ — числовой id группы (без минуса), как
-  # в group_ids. Заполняется по подсказке stats.py (запустите
-  # `python stats.py`, когда накопится статистика) — пример:
-  #   group_overrides:
-  #     123456789:
-  #       max_pages: 3
+  max_pages_per_query: 50
+  max_age_hours: 48
+  overlap_seconds: 300
   group_overrides: {}
-
+  request_timeout_seconds: 30
 avito:
-  enabled: true
-  # Поисковые запросы на Avito (используются как q= в URL поиска).
-  search_queries:
-    - "ремонт квартир под ключ"
-    - "ремонт под ключ"
-  # Регион/город в адресе Avito.
-  city_slug: "samara"
-  # Вариант 1 (рекомендуется), если Avito блокирует/показывает капчу —
-  # антидетект-браузер Dolphin{anty}, запускается автоматически на каждый
-  # прогон через его Local API. Нужно: открытое и залогиненное приложение
-  # Dolphin{anty} на этом же компьютере + ID профиля (см. README, раздел
-  # "Avito через Dolphin{anty}").
+  enabled: false
+  city_slug: samara
+  search_queries: []
+  headless: true
+  cdp_endpoint: ''
+  max_listings_per_query: 50
+  detail_limit: 50
+  request_timeout_seconds: 30
   dolphin:
     enabled: false
-    profile_id: "PUT_YOUR_DOLPHIN_PROFILE_ID"
-    # Меняйте, только если в Dolphin{anty} настроен нестандартный порт Local API.
-    local_api_url: "http://127.0.0.1:3001"
-  # Вариант 2 — ручное подключение к уже открытому браузеру по готовому
-  # CDP-адресу (например "http://127.0.0.1:PORT"). Используется, только
-  # если dolphin.enabled: false. Если оба варианта выключены — просто
-  # запускается обычный headless Chromium без антидетекта.
-  cdp_endpoint: ""
-  headless: true
-  max_listings_per_query: 50
-
-# ИИ-отбор лидов через OpenRouter (https://openrouter.ai) — дешёвая модель
-# дополнительно отсеивает то, что прошло по ключевым словам, но на самом деле
-# не заявка от клиента (реклама мастеров/фирм, не по теме, другой город и т.п.).
-# Выключено по умолчанию — без него просто попадает всё, что совпало по словам.
+    profile_id: ''
+    local_api_url: http://127.0.0.1:3001
 ai_filter:
-  enabled: true
-  # Ключ создаётся на https://openrouter.ai -> Settings -> API Keys.
-  openrouter_api_key: "PUT_YOUR_OPENROUTER_KEY"
-  # Актуальный список моделей и цены — https://openrouter.ai/models (меняются
-  # часто). Для такой простой классификации коротких текстов достаточно
-  # любой недорогой/бесплатной модели (в названии бесплатных обычно есть ":free").
-  model: "openai/gpt-4o-mini"
-  # Сколько лидов отправлять в одном запросе к модели (экономит запросы/деньги).
+  enabled: false
+  openrouter_api_key: ''
+  model: openai/gpt-4o-mini
   batch_size: 8
-  # Ниже этой уверенности лид не считается клиентом, даже если модель сказала "да".
-  # Подняли с 0.6 до 0.75 — модель иногда пропускала рекламу мастеров/бригад
-  # с невысокой уверенностью. Если после этого реальные заявки стали
-  # слишком часто отсеиваться — можно вернуть обратно ближе к 0.6-0.65.
   min_confidence: 0.75
-
+  max_text_chars: 12000
+  timeout_seconds: 60
+  max_attempts: 5
 output:
-  mode: "google_sheets"   # пока поддерживается только google_sheets
+  enabled: false
+  mode: google_sheets
   google_sheets:
-    # Путь к JSON-ключу сервисного аккаунта Google (см. README).
-    credentials_file: "service_account.json"
-    # ID таблицы (из её URL: https://docs.google.com/spreadsheets/d/<ЭТО>/edit)
-    spreadsheet_id: "PUT_YOUR_SPREADSHEET_ID"
-    worksheet_name: "Лиды"
-
+    credentials_file: service_account.json
+    spreadsheet_id: ''
+    worksheet_name: Лиды
+    timeout_seconds: 30
+notifications:
+  telegram:
+    enabled: false
+    bot_token: ''
+    chat_id: ''
+    chat_ids: []
+    timeout_seconds: 10
 schedule:
-  # Интервал автоматического запуска в минутах при запуске через
-  # `python main.py --loop`. Для запуска через системный cron/Task
-  # Scheduler это значение не используется.
   interval_minutes: 60
-
 storage:
-  # Файл, где хранятся ID уже отправленных лидов (дедупликация).
-  seen_store: "seen_leads.json"
+  database: .data/parser.sqlite3
+  seen_store: seen_leads.json
+  lock_file: .data/parser.lock
+delivery:
+  max_attempts: 8
+  retry_base_seconds: 60
+  retry_max_seconds: 3600
+  lease_seconds: 300
+  jobs_per_run: 100
+discovery:
+  city_id: null
+  max_groups: 2000
+  max_pages: 50
+  days: 7

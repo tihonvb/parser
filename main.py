@@ -1,144 +1,143 @@
-"""Точка входа: запускает все включённые источники, дедуплицирует лиды
-и дописывает новые строки в Google Таблицу.
-
-Разовый запуск:
-    python main.py
-
-Постоянный цикл с интервалом из config.yaml -> schedule.interval_minutes:
-    python main.py --loop
-
-Как альтернатива --loop, можно поставить `python main.py` в системный
-cron / Планировщик заданий Windows — тогда каждый запуск процесса
-завершается сам, что надёжнее долгоживущего цикла (см. README).
-"""
+"""Durable collection, classification and delivery. See README for exit codes."""
 
 from __future__ import annotations
 
 import argparse
+import importlib
+import json
 import sys
 import time
-import traceback
+from pathlib import Path
 
-from common import Lead, load_config
-from dedupe import SeenStore
+from filelock import FileLock, Timeout
+
+from ai_filter import filter_leads
+from common import ScanResult
+from configuration import CONFIG_PATH, ConfigError, load_config
+from delivery import drain
+from security import safe_error
+from storage import StorageError, Store
+from vk_token import TokenManager
 
 
-def run_once(cfg: dict) -> None:
-    all_leads: list[Lead] = []
-
-    sources = [
-        ("telegram", "telegram_parser"),
-        ("vk", "vk_parser"),
-        ("avito", "avito_parser"),
-    ]
-
-    for name, module_name in sources:
-        if not cfg.get(name, {}).get("enabled", True):
-            print(f"[main] Источник '{name}' выключен в конфиге — пропускаю.")
-            continue
-        try:
-            module = __import__(module_name)
-            leads = module.collect_leads(cfg)
-            print(f"[main] {name}: найдено {len(leads)} потенциальных лидов.")
-            all_leads.extend(leads)
-        except Exception:
-            print(f"[main] Ошибка в источнике '{name}':")
-            traceback.print_exc()
-
-    if not all_leads:
-        print("[main] Новых лидов не найдено, таблицу не трогаю.")
-        return
-
-    store = SeenStore(cfg["storage"]["seen_store"])
-    fresh = [lead for lead in all_leads if store.is_new(lead.dedupe_key())]
-
-    if not fresh:
-        print("[main] Все найденные лиды уже были отправлены ранее (дубликаты).")
-        return
-
-    try:
-        import ai_filter
-
-        kept = ai_filter.filter_leads(cfg, fresh)
-    except Exception:
-        print("[main] Ошибка в ai_filter — лиды не отправляю без проверки, повторю в следующем прогоне:")
-        traceback.print_exc()
-        for lead in fresh:
-            lead.extra["ai_pending"] = True
-        kept = []
-
-    # Отфильтрованный ИИ мусор помечаем "видели" сразу — это не заказы,
-    # пересматривать их смысла нет, а деньги на повторную классификацию
-    # тратить не хочется.
-    # Лиды с ai_pending (OpenRouter не ответил) не трогаем — они не
-    # "отклонены", а просто не проверены, и проверятся в следующем прогоне.
-    kept_keys = {lead.dedupe_key() for lead in kept}
-    rejected = [
-        lead for lead in fresh
-        if lead.dedupe_key() not in kept_keys and not lead.extra.get("ai_pending")
-    ]
-    for lead in rejected:
-        store.mark(lead.dedupe_key())
-    store.save()
-
-    if not kept:
-        print("[main] После дедупликации/ИИ-фильтра новых лидов для таблицы не осталось.")
-        return
-
-    try:
-        import sheets_writer
-
-        added = sheets_writer.append_leads(cfg, kept)
-        print(f"[main] Добавлено новых строк в таблицу: {added}")
-
-        try:
-            import telegram_notify
-
-            telegram_notify.send_leads_notifications(cfg, kept)
-        except Exception:
-            print("[main] Не удалось отправить уведомления в Telegram (не критично):")
-            traceback.print_exc()
-    except Exception:
-        print("[main] Ошибка при записи в Google Таблицу (проверьте service_account.json / spreadsheet_id / доступ):")
-        traceback.print_exc()
-        print(
-            f"[main] Внимание: {len(kept)} потенциально реальных лидов НЕ записаны в таблицу "
-            "и НЕ помечены как отправленные — при следующем запуске main.py они будут "
-            "собраны и проверены ИИ-фильтром заново (не потеряются)."
+def run_once(cfg: dict, *, deliver_only=False) -> tuple[int, dict]:
+    Path(cfg["storage"]["lock_file"]).parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(cfg["storage"]["lock_file"], timeout=0), Store(cfg["storage"]["database"]) as store:
+        store.import_legacy(cfg["storage"]["seen_store"])
+        reports = []
+        if not deliver_only:
+            for source in ("telegram", "vk", "avito"):
+                if not cfg[source]["enabled"]:
+                    continue
+                try:
+                    if source == "vk" and cfg["vk"]["token_mode"] == "vk_id":
+                        cfg["vk"]["access_token"] = TokenManager(cfg).refresh()
+                    module = importlib.import_module(source + "_parser")
+                    leads = module.collect_leads(cfg, store=store, reports=reports)
+                    store.ingest(leads)  # also supports compatible collectors; page sinks already persisted
+                except Exception as error:
+                    report = ScanResult(source + ":collector")
+                    report.fail(safe_error(error))
+                    reports.append(report)
+                    store.checkpoint(report)
+        # Bound expensive work; unprocessed/pending candidates remain in SQLite for later runs.
+        pending = store.pending_ai(limit=cfg["delivery"]["jobs_per_run"])
+        if pending:
+            accepted = {lead.dedupe_key() for lead in filter_leads(cfg, pending)}
+            for lead in pending:
+                state = (
+                    "pending"
+                    if lead.extra.get("ai_pending")
+                    else "accepted"
+                    if lead.dedupe_key() in accepted
+                    else "rejected"
+                )
+                store.classification(
+                    lead,
+                    state,
+                    verdict=lead.extra,
+                    error=lead.extra.get("ai_error"),
+                    max_attempts=cfg["ai_filter"]["max_attempts"],
+                    retry_seconds=cfg["delivery"]["retry_base_seconds"],
+                )
+        delivered = drain(cfg, store)
+        report = {
+            **store.summary(),
+            "this_run": {
+                "delivery": delivered,
+                "sources": [
+                    {
+                        "id": item.source_id,
+                        "complete": item.complete,
+                        "scanned": item.scanned,
+                        "candidates": item.candidates,
+                        "errors": item.errors,
+                    }
+                    for item in reports
+                ],
+            },
+        }
+        problems = (
+            any(not result.complete for result in reports)
+            or any(report["leads"].get(state, 0) for state in ("pending", "review"))
+            or any(report["deliveries"].get(state, 0) for state in ("pending", "leased", "failed"))
         )
-        return
-
-    # Помечаем "видели" только те лиды, что реально долетели до таблицы —
-    # иначе при сбое записи (как выше) лиды тихо терялись бы навсегда.
-    for lead in kept:
-        store.mark(lead.dedupe_key())
-    store.save()
+        return int(problems), report
 
 
-def main() -> None:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--loop", action="store_true", help="Крутиться в цикле с интервалом из config.yaml")
-    args = parser.parse_args()
-
-    cfg = load_config()
-
-    if not args.loop:
-        run_once(cfg)
-        return
-
-    interval = cfg.get("schedule", {}).get("interval_minutes", 60)
-    print(f"[main] Запуск в цикле, интервал {interval} мин. Остановка — Ctrl+C.")
-    while True:
-        try:
-            run_once(cfg)
-        except KeyboardInterrupt:
-            print("[main] Остановлено пользователем.")
-            sys.exit(0)
-        except Exception:
-            print("[main] Непредвиденная ошибка в run_once:")
-            traceback.print_exc()
-        time.sleep(interval * 60)
+    parser.add_argument("--config", default=str(CONFIG_PATH))
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--check-config", action="store_true", help="Validate without connecting to any API")
+    parser.add_argument(
+        "--deliver-only",
+        action="store_true",
+        help="Resume persisted classification/delivery without collecting",
+    )
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--backup", metavar="NEW_PATH")
+    parser.add_argument("--reclassify", metavar="SOURCE:ID")
+    parser.add_argument("--retry-failed", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        cfg = load_config(args.config)
+        if args.check_config:
+            print("Configuration valid; no API calls made.")
+            return 0
+        if args.status or args.backup or args.reclassify or args.retry_failed:
+            Path(cfg["storage"]["lock_file"]).parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(cfg["storage"]["lock_file"], timeout=0), Store(cfg["storage"]["database"]) as store:
+                if args.backup:
+                    store.backup(args.backup)
+                if args.reclassify:
+                    store.reclassify(args.reclassify)
+                if args.retry_failed:
+                    store.retry_failed()
+                print(json.dumps(store.summary(), ensure_ascii=False, indent=2))
+            return 0
+        while True:
+            cfg = load_config(args.config)  # reload and revalidate every cycle
+            code, report = run_once(cfg, deliver_only=args.deliver_only)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if not args.loop:
+                return code
+            time.sleep(cfg["schedule"]["interval_minutes"] * 60)
+    except ConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    except Timeout:
+        print("Another parser/token operation holds the lock.", file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        return 0
+    except Exception as error:
+        print(
+            "Parser failed: " + (str(error) if isinstance(error, StorageError) else safe_error(error)),
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
