@@ -7,12 +7,35 @@
 1. Остановить расписание и сделать snapshot через прежнюю команду backup; отдельно сохранить конфигурацию и секреты.
 2. Установить проверенный commit, выполнить `uv sync --locked --no-dev`. Проект устанавливается как пакет; запуск отдельных файлов из `src/` не требуется.
 3. Запустить `uv run --locked lead-parser --config /absolute/path/config.yaml --check-config`, затем `--status`. Сверить число кандидатов/заданий и сохранённые контрольные точки с отчётом до обновления.
-4. Обновить команду планировщика на `/absolute/path/.venv/bin/lead-parser --config /absolute/path/config.yaml`. Старый `python main.py` продолжает работать через CLI-обёртку. Сохранять прежний `storage.lock_file` и один экземпляр расписания.
+4. Обновить команду cron или `ExecStart` в systemd на `/absolute/path/.venv/bin/lead-parser --config /absolute/path/config.yaml`; для изменённого unit выполнить `systemctl daemon-reload`. Корневые Python-скрипты удалены, поэтому прежние команды запуска нужно заменить до возобновления расписания. Сохранять прежний `storage.lock_file` и один экземпляр расписания.
 5. Возобновить обработку и проверить отчёт. Для первого восстановления очереди доступен `--deliver-only`.
 
 Альтернатива консоли — `python -m lead_parser` из установленного окружения. Сборка wheel: `uv build --wheel`; wheel содержит пакет и синтетический evaluation-набор, конфигурацию и рабочие секреты размещают снаружи. Для wheel также нужно отдельно установить согласованные runtime-зависимости и Chromium, если используется обычный браузер Avito.
 
-Старые библиотечные импорты (`from common import Lead`, `from storage import Store`) заменены пакетными: `lead_parser.core.models.Lead`, `lead_parser.infrastructure.persistence.sqlite.Store`. Корневые скрипты сохраняют совместимость запуска команд, а не прежний Python API. [Слои и точки расширения](architecture.md).
+Старые библиотечные импорты (`from common import Lead`, `from storage import Store`) заменены пакетными: `lead_parser.core.models.Lead`, `lead_parser.infrastructure.persistence.sqlite.Store`. [Слои и точки расширения](architecture.md).
+
+## Переход на единый CLI
+
+Удаление корневых скриптов меняет команды запуска. Используйте установленную консоль `lead-parser` или эквивалентный `python -m lead_parser`; из checkout команды выполняются через `uv run --locked`. Параметры передаются после подкоманды, например `lead-parser stats --config /absolute/path/config.yaml --top 10`.
+
+| Прежняя команда | Новая команда |
+| --- | --- |
+| `python main.py …` | `lead-parser …` |
+| `python discover.py …` | `lead-parser discover …` |
+| `python evaluate.py …` | `lead-parser evaluate …` |
+| `python stats.py …` | `lead-parser stats …` |
+| `python fix_sheet.py …` | `lead-parser migrate-sheet …` |
+| `python find_vk_groups.py …` | `lead-parser vk-groups …` |
+| `python extract_vk_groups.py …` | `lead-parser extract-vk-groups …` |
+| `python vk_discovery.py …` | `lead-parser vk-discovery …` |
+| `python telegram_discovery.py …` | `lead-parser telegram-discovery …` |
+| `python telegram_parser.py login …` | `lead-parser telegram-auth login …` |
+| `python vk_token.py login\|code\|refresh …` | `lead-parser vk-auth login\|code\|refresh …` |
+| `python vk_oauth_pkce.py step1 …` | `lead-parser vk-auth login …` |
+| `python vk_oauth_pkce.py step2 CALLBACK …` | `lead-parser vk-auth code CALLBACK …` |
+| `python vk_refresh_and_sync.py …` | `lead-parser vk-auth refresh …` |
+
+`CALLBACK` — полный URL с `code`, `state` и остальными параметрами ответа VK, переданный одним аргументом в кавычках. Старые OAuth-модули `vk_oauth_pkce` и `vk_refresh_and_sync` удалены также из пакета. Замена CLI не меняет схему SQLite или сохранённые данные.
 
 ## Первичный переход с JSON-дедупликации
 

@@ -21,7 +21,7 @@ def main(argv=None):
         manager = TokenManager(load_config(args.config, require_access=False))
         if args.command == "login":
             print(manager.login())
-            print("Run vk_token.py code with the complete callback within 10 minutes.")
+            print("Run lead-parser vk-auth code with the complete callback within 10 minutes.")
         elif args.command == "code":
             if not args.callback:
                 raise TokenError("Complete callback URL required")

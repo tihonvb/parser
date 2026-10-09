@@ -52,7 +52,9 @@ class SheetsWriter:
             self.ws.update(values=[HEADER], range_name="A1:M1", value_input_option="RAW")
             rows = [HEADER]
         if rows[0][: len(HEADER)] != HEADER:
-            raise SchemaConflict("Sheet schema differs; run fix_sheet.py dry-run and backed-up migration")
+            raise SchemaConflict(
+                "Sheet schema differs; run lead-parser migrate-sheet dry-run and backed-up migration"
+            )
         self.minimum_row = len(rows) + 1
         self.existing: dict[str, int] = {}
         for index, row in enumerate(rows[1:], 2):

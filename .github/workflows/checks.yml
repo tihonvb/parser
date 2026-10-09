@@ -35,8 +35,8 @@ jobs:
       - run: uv run --locked ruff check .
       - run: uv run --locked ruff format --check .
       - run: uv run --locked pytest -q
-      - run: uv run --locked python main.py --config config.example.yaml --check-config
-      - run: uv run --locked python evaluate.py --config config.example.yaml --output reports/offline.json
+      - run: uv run --locked lead-parser --config config.example.yaml --check-config
+      - run: uv run --locked lead-parser evaluate --config config.example.yaml --output reports/offline.json
       - run: uv run --locked python scripts/check_secrets.py
       - name: Build and smoke-test installed wheel outside checkout
         shell: bash

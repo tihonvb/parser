@@ -23,7 +23,7 @@
 | [#17](https://github.com/tihonvb/parser/issues/17) | Явное владение browser/context/pages/Dolphin, независимая очистка | borrowed CDP/connect failure/context failure тесты |
 | [#18](https://github.com/tihonvb/parser/issues/18) | Raw execute_errors, выборочные ограниченные retry, size split/direct fallback, durable partial pages | raw subcalls/permission/size/page failure тесты |
 | [#19](https://github.com/tihonvb/parser/issues/19) | Canonical source ID, rename-safe ranking/overrides, city-scoped discovery, unknown metadata, coverage | identical-name/rename/geography/member/depth тесты |
-| [#20](https://github.com/tihonvb/parser/issues/20) | Единственный VK TokenManager, wrappers, legacy migration, expiry/rotation/lock, обязательный state/TTL | `tests/test_auth.py`; токены в captured logs отсутствуют |
+| [#20](https://github.com/tihonvb/parser/issues/20) | Единственный VK TokenManager и единый CLI `lead-parser vk-auth`, legacy migration, expiry/rotation/lock, обязательный state/TTL | `tests/test_auth.py`; токены в captured logs отсутствуют |
 
 Issues не закрываются вручную до review/merge. PR связывает реализации с задачами. #10 не помечается полностью выполненной без фактически установленной защиты main.
 

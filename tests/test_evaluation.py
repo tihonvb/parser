@@ -30,11 +30,9 @@ def test_online_full_pipeline_separates_technical_from_semantic(cfg):
     assert report["pipeline"] is None
 
 
-def test_service_script_imports_have_no_side_effects(tmp_path, monkeypatch):
+def test_package_imports_have_no_side_effects(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     root = Path(__file__).resolve().parents[1]
-    for path in root.glob("*.py"):
-        importlib.import_module(path.stem)
     for path in (root / "src" / "lead_parser").rglob("*.py"):
         module = ".".join(path.relative_to(root / "src").with_suffix("").parts)
         importlib.import_module(module.removesuffix(".__init__"))

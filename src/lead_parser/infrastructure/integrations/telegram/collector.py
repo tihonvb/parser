@@ -147,7 +147,7 @@ async def collect_leads_async(
     try:
         await asyncio.wait_for(client.connect(), timeout=settings["channel_timeout_seconds"])
         if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
-            raise TelegramAuthorizationRequired("Run telegram_parser.py login interactively")
+            raise TelegramAuthorizationRequired("Run lead-parser telegram-auth login interactively")
         semaphore = asyncio.Semaphore(settings["max_concurrent_channels"])
 
         async def bounded(channel):
