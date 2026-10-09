@@ -61,15 +61,22 @@ def run_once(cfg: dict) -> None:
 
         kept = ai_filter.filter_leads(cfg, fresh)
     except Exception:
-        print("[main] Ошибка в ai_filter, пропускаю ИИ-фильтрацию на этот раз (лиды оставлены как есть):")
+        print("[main] Ошибка в ai_filter — лиды не отправляю без проверки, повторю в следующем прогоне:")
         traceback.print_exc()
-        kept = fresh
+        for lead in fresh:
+            lead.extra["ai_pending"] = True
+        kept = []
 
     # Отфильтрованный ИИ мусор помечаем "видели" сразу — это не заказы,
     # пересматривать их смысла нет, а деньги на повторную классификацию
     # тратить не хочется.
+    # Лиды с ai_pending (OpenRouter не ответил) не трогаем — они не
+    # "отклонены", а просто не проверены, и проверятся в следующем прогоне.
     kept_keys = {lead.dedupe_key() for lead in kept}
-    rejected = [lead for lead in fresh if lead.dedupe_key() not in kept_keys]
+    rejected = [
+        lead for lead in fresh
+        if lead.dedupe_key() not in kept_keys and not lead.extra.get("ai_pending")
+    ]
     for lead in rejected:
         store.mark(lead.dedupe_key())
     store.save()
@@ -83,6 +90,14 @@ def run_once(cfg: dict) -> None:
 
         added = sheets_writer.append_leads(cfg, kept)
         print(f"[main] Добавлено новых строк в таблицу: {added}")
+
+        try:
+            import telegram_notify
+
+            telegram_notify.send_leads_notifications(cfg, kept)
+        except Exception:
+            print("[main] Не удалось отправить уведомления в Telegram (не критично):")
+            traceback.print_exc()
     except Exception:
         print("[main] Ошибка при записи в Google Таблицу (проверьте service_account.json / spreadsheet_id / доступ):")
         traceback.print_exc()
