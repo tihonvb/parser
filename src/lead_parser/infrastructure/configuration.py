@@ -34,6 +34,12 @@ DEFAULTS = {
     },
     "telegram": {
         "enabled": False,
+        "transport": "account",
+        "public_web": {
+            "max_pages_per_channel": 15,
+            "request_delay_seconds": 1.0,
+            "request_timeout_seconds": 20.0,
+        },
         "api_id": "",
         "api_hash": "",
         "session_name": ".data/telegram",
@@ -194,6 +200,20 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
     for section in ("telegram", "vk", "avito", "ai_filter", "output"):
         if type(cfg[section].get("enabled")) is not bool:
             raise ConfigError(f"{section}.enabled: expected boolean")
+    if cfg["telegram"]["transport"] not in {"account", "public_web"}:
+        raise ConfigError("telegram.transport: expected 'account' or 'public_web'")
+    for key, integer in (
+        ("max_pages_per_channel", True),
+        ("request_delay_seconds", False),
+        ("request_timeout_seconds", False),
+    ):
+        value = cfg["telegram"]["public_web"][key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ConfigError(f"telegram.public_web.{key}: expected a finite number")
+        if integer and not isinstance(value, int):
+            raise ConfigError(f"telegram.public_web.{key}: expected an integer")
+        if value <= 0 or (key == "max_pages_per_channel" and value > 500):
+            raise ConfigError(f"telegram.public_web.{key}: outside allowed range")
     general = cfg["general"]
     if not _filled(general.get("city")) or not _filled(general.get("work_type")):
         raise ConfigError("general.city and general.work_type must be filled")
@@ -293,21 +313,24 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("Notifications require Sheets delivery to be enabled")
     if not require_access:
         return
+    account_mode = cfg["telegram"]["transport"] == "account"
     for section, key in (
         ("telegram", "api_id"),
         ("telegram", "api_hash"),
         ("ai_filter", "openrouter_api_key"),
     ):
-        if cfg[section]["enabled"] and not _filled(cfg[section][key]):
+        needs_key = section != "telegram" or account_mode  # public_web needs no Telegram keys
+        if cfg[section]["enabled"] and needs_key and not _filled(cfg[section][key]):
             raise ConfigError(f"{section}.{key}: required when enabled")
     if cfg["telegram"]["enabled"]:
         if not cfg["telegram"]["channels"]:
             raise ConfigError("telegram.channels: required when enabled")
-        try:
-            if int(cfg["telegram"]["api_id"]) <= 0:
-                raise ValueError
-        except (TypeError, ValueError) as error:
-            raise ConfigError("telegram.api_id: expected positive integer") from error
+        if account_mode:
+            try:
+                if int(cfg["telegram"]["api_id"]) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError) as error:
+                raise ConfigError("telegram.api_id: expected positive integer") from error
     if (
         cfg["vk"]["enabled"]
         and cfg["vk"]["token_mode"] == "static"

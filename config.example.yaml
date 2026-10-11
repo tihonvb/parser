@@ -9,6 +9,14 @@ general:
   exclude_keywords: []
 telegram:
   enabled: false
+  # account — читать каналы от имени вашего аккаунта (Telethon): нужны api_id/api_hash.
+  # public_web — читать ПУБЛИЧНЫЕ каналы через веб-превью t.me/s/<канал>, без аккаунта и ключей
+  #   (docs/telegram-public-web.md; только открытые каналы, ~20 сообщений на страницу).
+  transport: account
+  public_web:
+    max_pages_per_channel: 15
+    request_delay_seconds: 1.0
+    request_timeout_seconds: 20.0
   api_id: ''
   api_hash: ''
   session_name: .data/telegram

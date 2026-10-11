@@ -29,6 +29,7 @@ from lead_parser.infrastructure.integrations.google_sheets.gateway import (
 )
 from lead_parser.infrastructure.integrations.openrouter.classifier import PROMPT_VERSION, OpenRouterClassifier
 from lead_parser.infrastructure.integrations.telegram import collector as telegram
+from lead_parser.infrastructure.integrations.telegram import public_web as telegram_public_web
 from lead_parser.infrastructure.integrations.telegram.notifications import TelegramGateway, _collect_chat_ids
 from lead_parser.infrastructure.integrations.vk import collector as vk
 from lead_parser.infrastructure.integrations.vk.oauth import TokenManager
@@ -50,9 +51,11 @@ class ConfiguredSource:
 
 
 def build_sources(cfg: dict) -> tuple[LeadSource, ...]:
+    # telegram.transport: account (Telethon, needs api_id/api_hash) | public_web (t.me/s/<channel>, no keys)
+    telegram_module = telegram_public_web if cfg["telegram"]["transport"] == "public_web" else telegram
     return tuple(
         ConfiguredSource(name, cfg, module.collect_leads)
-        for name, module in (("telegram", telegram), ("vk", vk), ("avito", avito))
+        for name, module in (("telegram", telegram_module), ("vk", vk), ("avito", avito))
         if cfg[name]["enabled"]
     )
 
