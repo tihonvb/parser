@@ -28,6 +28,7 @@ from lead_parser.infrastructure.integrations.google_sheets.gateway import (
     destination,
 )
 from lead_parser.infrastructure.integrations.openrouter.classifier import PROMPT_VERSION, OpenRouterClassifier
+from lead_parser.infrastructure.integrations.profi import collector as profi
 from lead_parser.infrastructure.integrations.telegram import collector as telegram
 from lead_parser.infrastructure.integrations.telegram.notifications import TelegramGateway, _collect_chat_ids
 from lead_parser.infrastructure.integrations.vk import collector as vk
@@ -52,7 +53,7 @@ class ConfiguredSource:
 def build_sources(cfg: dict) -> tuple[LeadSource, ...]:
     return tuple(
         ConfiguredSource(name, cfg, module.collect_leads)
-        for name, module in (("telegram", telegram), ("vk", vk), ("avito", avito))
+        for name, module in (("telegram", telegram), ("vk", vk), ("avito", avito), ("profi", profi))
         if cfg[name]["enabled"]
     )
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 from dotenv import dotenv_values
@@ -74,6 +76,32 @@ DEFAULTS = {
         "detail_limit": 50,
         "request_timeout_seconds": 30,
         "dolphin": {"enabled": False, "profile_id": "", "local_api_url": "http://127.0.0.1:3001"},
+    },
+    "profi": {
+        # Кабинет специалиста profi.ru через браузер (docs/profi-connector.md). Селекторы заполняются
+        # по реальной странице командой `lead-parser profi-auth inspect`: пустые = коннектор не запустится.
+        "enabled": False,
+        "urls": [],
+        "storage_state": ".data/profi_state.json",
+        "cdp_endpoint": "",
+        "headless": True,
+        "max_orders_per_page": 50,
+        "request_timeout_seconds": 30,
+        "page_delay_seconds": 3,
+        "order_id_pattern": r"(\d{5,})",
+        "require_city_match": False,
+        "selectors": {
+            "card": "",
+            "link": "",
+            "title": "",
+            "description": "",
+            "price": "",
+            "city": "",
+            "date": "time[datetime]",
+            "logged_in": "",
+            "login_form": "input[type=password], input[type=tel], input[name=phone]",
+            "empty": "",
+        },
     },
     "ai_filter": {
         "enabled": False,
@@ -191,7 +219,7 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
     for section in DEFAULTS:
         if not isinstance(cfg.get(section), dict):
             raise ConfigError(f"{section}: expected a mapping")
-    for section in ("telegram", "vk", "avito", "ai_filter", "output"):
+    for section in ("telegram", "vk", "avito", "profi", "ai_filter", "output"):
         if type(cfg[section].get("enabled")) is not bool:
             raise ConfigError(f"{section}.enabled: expected boolean")
     general = cfg["general"]
@@ -213,6 +241,7 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         ],
         "vk": ["posts_per_run", "max_pages_per_query", "request_timeout_seconds"],
         "avito": ["max_listings_per_query", "detail_limit", "request_timeout_seconds"],
+        "profi": ["max_orders_per_page", "request_timeout_seconds", "page_delay_seconds"],
         "ai_filter": ["batch_size", "max_text_chars", "timeout_seconds", "max_attempts"],
         "delivery": [
             "max_attempts",
@@ -224,7 +253,12 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         "discovery": ["max_groups", "max_pages", "days"],
     }.items():
         for key in keys:
-            _number(cfg, section, key, integer=key not in {"interval_minutes", "lookback_hours"})
+            _number(
+                cfg,
+                section,
+                key,
+                integer=key not in {"interval_minutes", "lookback_hours", "page_delay_seconds"},
+            )
     _number(cfg, "ai_filter", "min_confidence", high=1, allow_zero=True)
     _number(cfg, "vk", "max_age_hours", allow_zero=True)
     _number(cfg, "vk", "overlap_seconds", allow_zero=True)
@@ -291,6 +325,7 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("notifications.telegram.chat_ids: invalid recipients")
     if tg["enabled"] and not cfg["output"]["enabled"]:
         raise ConfigError("Notifications require Sheets delivery to be enabled")
+    _validate_profi_static(cfg["profi"])
     if not require_access:
         return
     for section, key in (
@@ -320,12 +355,51 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("avito.search_queries: required when enabled")
     if cfg["avito"]["dolphin"]["enabled"] and not _filled(cfg["avito"]["dolphin"]["profile_id"]):
         raise ConfigError("avito.dolphin.profile_id: required when enabled")
+    _validate_profi_enabled(cfg["profi"])
     if cfg["output"]["enabled"] and not _filled(cfg["output"]["google_sheets"]["spreadsheet_id"]):
         raise ConfigError("output.google_sheets.spreadsheet_id: required when enabled")
     if cfg["output"]["enabled"] and not Path(cfg["output"]["google_sheets"]["credentials_file"]).is_file():
         raise ConfigError("output.google_sheets.credentials_file: credentials file required")
     if tg["enabled"] and (not _filled(tg["bot_token"]) or not (tg["chat_id"] or tg["chat_ids"])):
         raise ConfigError("notifications.telegram: bot_token and recipients required")
+
+
+def _validate_profi_static(profi: dict) -> None:
+    """Shape checks that never need the connector to be enabled."""
+    if not isinstance(profi["urls"], list):
+        raise ConfigError("profi.urls: expected list")
+    if type(profi["headless"]) is not bool or type(profi["require_city_match"]) is not bool:
+        raise ConfigError("profi.headless and profi.require_city_match: expected boolean")
+    try:
+        pattern = re.compile(profi["order_id_pattern"])
+    except re.error as error:
+        raise ConfigError("profi.order_id_pattern: invalid regular expression") from error
+    if pattern.groups != 1:
+        raise ConfigError("profi.order_id_pattern: exactly one capturing group expected")
+
+
+def _validate_profi_enabled(profi: dict) -> None:
+    """Without calibrated selectors the connector refuses to start (no guessing)."""
+    if not profi["enabled"]:
+        return
+    if not profi["urls"]:
+        raise ConfigError("profi.urls: required when enabled (order list pages of the specialist cabinet)")
+    for url in profi["urls"]:
+        parts = urlsplit(url) if isinstance(url, str) else None
+        host = parts.hostname if parts else None
+        if (
+            not parts
+            or parts.scheme != "https"
+            or not host
+            or not (host == "profi.ru" or host.endswith(".profi.ru"))
+        ):
+            raise ConfigError("profi.urls: only https://profi.ru/... addresses are allowed")
+    for key in ("card", "link", "logged_in"):
+        if not profi["selectors"][key].strip():
+            raise ConfigError(
+                f"profi.selectors.{key}: required; calibrate with `lead-parser profi-auth inspect` "
+                "(docs/profi-connector.md)"
+            )
 
 
 def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) -> dict[str, Any]:
@@ -359,6 +433,7 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
         "storage": ["database", "seen_store", "lock_file"],
         "telegram": ["session_name"],
         "vk": ["token_file", "state_file"],
+        "profi": ["storage_state"],
     }.items():
         for key in keys:
             if not cfg[section][key].strip():

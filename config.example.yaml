@@ -50,6 +50,31 @@ avito:
     enabled: false
     profile_id: ''
     local_api_url: http://127.0.0.1:3001
+# Кабинет специалиста profi.ru через браузер (docs/profi-connector.md). Селекторы пустые намеренно:
+# заполните их по странице, сохранённой командой `lead-parser profi-auth inspect`.
+profi:
+  enabled: false
+  urls: []                       # https://profi.ru/... — страницы со списком заказов
+  storage_state: .data/profi_state.json
+  cdp_endpoint: ''
+  headless: true
+  max_orders_per_page: 50
+  request_timeout_seconds: 30
+  page_delay_seconds: 3
+  order_id_pattern: '(\d{5,})'
+  require_city_match: false
+  selectors:
+    card: ''
+    link: ''
+    title: ''
+    description: ''
+    price: ''
+    city: ''
+    date: time[datetime]
+    logged_in: ''
+    login_form: input[type=password], input[type=tel], input[name=phone]
+    empty: ''
+
 ai_filter:
   enabled: false
   openrouter_api_key: ''
