@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,24 @@ DEFAULTS = {
         "request_timeout_seconds": 30,
         "dolphin": {"enabled": False, "profile_id": "", "local_api_url": "http://127.0.0.1:3001"},
     },
+    "profi_mail": {
+        # Заказы Профи.ру из уведомлений на почту специалиста (IMAP, только чтение; docs/profi-mail.md).
+        "enabled": False,
+        "host": "",
+        "port": 993,
+        "username": "",
+        "password": "",
+        "folder": "INBOX",
+        "sender_domains": ["profi.ru"],
+        "subject_regex": "",
+        "lookback_days": 3,
+        "max_messages_per_run": 200,
+        "request_timeout_seconds": 30,
+        "link_pattern": r"https://(?:[\w-]+\.)?profi\.ru/[^\s\x22\x27<>)\]]+",
+        "order_id_pattern": r"(\d{5,})",
+        "body_start_regex": "",
+        "body_end_regex": "",
+    },
     "ai_filter": {
         "enabled": False,
         "openrouter_api_key": "",
@@ -124,6 +143,7 @@ ENV_MAP = {
     "GOOGLE_SPREADSHEET_ID": ("output", "google_sheets", "spreadsheet_id"),
     "TELEGRAM_BOT_TOKEN": ("notifications", "telegram", "bot_token"),
     "TELEGRAM_CHAT_ID": ("notifications", "telegram", "chat_id"),
+    "PROFI_MAIL_PASSWORD": ("profi_mail", "password"),
 }
 
 
@@ -191,7 +211,7 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
     for section in DEFAULTS:
         if not isinstance(cfg.get(section), dict):
             raise ConfigError(f"{section}: expected a mapping")
-    for section in ("telegram", "vk", "avito", "ai_filter", "output"):
+    for section in ("telegram", "vk", "avito", "profi_mail", "ai_filter", "output"):
         if type(cfg[section].get("enabled")) is not bool:
             raise ConfigError(f"{section}.enabled: expected boolean")
     general = cfg["general"]
@@ -213,6 +233,7 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         ],
         "vk": ["posts_per_run", "max_pages_per_query", "request_timeout_seconds"],
         "avito": ["max_listings_per_query", "detail_limit", "request_timeout_seconds"],
+        "profi_mail": ["port", "lookback_days", "max_messages_per_run", "request_timeout_seconds"],
         "ai_filter": ["batch_size", "max_text_chars", "timeout_seconds", "max_attempts"],
         "delivery": [
             "max_attempts",
@@ -291,8 +312,10 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("notifications.telegram.chat_ids: invalid recipients")
     if tg["enabled"] and not cfg["output"]["enabled"]:
         raise ConfigError("Notifications require Sheets delivery to be enabled")
+    _validate_profi_mail_static(cfg["profi_mail"])
     if not require_access:
         return
+    _validate_profi_mail_enabled(cfg["profi_mail"])
     for section, key in (
         ("telegram", "api_id"),
         ("telegram", "api_hash"),
@@ -326,6 +349,46 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("output.google_sheets.credentials_file: credentials file required")
     if tg["enabled"] and (not _filled(tg["bot_token"]) or not (tg["chat_id"] or tg["chat_ids"])):
         raise ConfigError("notifications.telegram: bot_token and recipients required")
+
+
+def _compile(label: str, pattern: str, *, groups: int | None = None) -> None:
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        raise ConfigError(f"profi_mail.{label}: invalid regular expression") from error
+    if groups is not None and compiled.groups != groups:
+        raise ConfigError(f"profi_mail.{label}: exactly {groups} capturing group expected")
+
+
+def _validate_profi_mail_static(mail: dict) -> None:
+    """Shape checks that never need the connector to be enabled."""
+    domains = mail["sender_domains"]
+    if (
+        not isinstance(domains, list)
+        or not domains
+        or any(
+            not isinstance(d, str) or not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", d.lower()) for d in domains
+        )
+    ):
+        raise ConfigError("profi_mail.sender_domains: expected a non-empty list of domains like profi.ru")
+    for key in ("subject_regex", "body_start_regex", "body_end_regex"):
+        if not isinstance(mail[key], str):
+            raise ConfigError(f"profi_mail.{key}: expected string")
+        _compile(key, mail[key])
+    _compile("link_pattern", mail["link_pattern"])
+    _compile("order_id_pattern", mail["order_id_pattern"], groups=1)
+    if not 1 <= mail["port"] <= 65535 or mail["lookback_days"] > 60 or mail["max_messages_per_run"] > 5000:
+        raise ConfigError(
+            "profi_mail: port, lookback_days (<=60) or max_messages_per_run (<=5000) out of range"
+        )
+
+
+def _validate_profi_mail_enabled(mail: dict) -> None:
+    if not mail["enabled"]:
+        return
+    for key in ("host", "username", "password", "folder"):
+        if not _filled(mail[key]):
+            raise ConfigError(f"profi_mail.{key}: required when enabled (password: PROFI_MAIL_PASSWORD)")
 
 
 def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) -> dict[str, Any]:

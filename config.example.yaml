@@ -50,6 +50,25 @@ avito:
     enabled: false
     profile_id: ''
     local_api_url: http://127.0.0.1:3001
+# Заказы Профи.ру из уведомлений на почту специалиста (IMAP, только чтение; docs/profi-mail.md).
+# Пароль приложения — в .env: PROFI_MAIL_PASSWORD
+profi_mail:
+  enabled: false
+  host: ''
+  port: 993
+  username: ''
+  password: ''
+  folder: INBOX
+  sender_domains: [profi.ru]
+  subject_regex: ''
+  lookback_days: 3
+  max_messages_per_run: 200
+  request_timeout_seconds: 30
+  link_pattern: 'https://(?:[\w-]+\.)?profi\.ru/[^\s\x22\x27<>)\]]+'
+  order_id_pattern: '(\d{5,})'
+  body_start_regex: ''
+  body_end_regex: ''
+
 ai_filter:
   enabled: false
   openrouter_api_key: ''
