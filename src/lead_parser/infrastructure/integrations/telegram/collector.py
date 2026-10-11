@@ -14,11 +14,11 @@ from lead_parser.application.models import ScanResult
 from lead_parser.application.ports import CollectionState
 from lead_parser.core.models import Lead
 from lead_parser.core.policies import extract_phone, keyword_decision
+from lead_parser.infrastructure.integrations.telegram.client import (
+    TelegramAccount,
+    TelegramAuthorizationRequired,
+)
 from lead_parser.infrastructure.security import safe_error
-
-
-class TelegramAuthorizationRequired(RuntimeError):
-    pass
 
 
 async def _collect_from_channel(
@@ -134,16 +134,7 @@ async def collect_leads_async(
     if not settings["enabled"]:
         return []
     session = Path(settings["session_name"])
-    session.parent.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(
-        str(session),
-        int(settings["api_id"]),
-        settings["api_hash"],
-        flood_sleep_threshold=0,
-        request_retries=1,
-        connection_retries=1,
-        timeout=10,
-    )
+    client = _account(cfg).new_client()
     try:
         await asyncio.wait_for(client.connect(), timeout=settings["channel_timeout_seconds"])
         if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
@@ -180,15 +171,14 @@ def collect_leads(
     return asyncio.run(collect_leads_async(cfg, store, reports))
 
 
+def _account(cfg: dict) -> TelegramAccount:
+    """Single constructor of the account client. The factory is resolved on every call so
+    that ``TelegramClient`` patched in this module (tests) is honoured."""
+    return TelegramAccount.from_config(
+        cfg, client_factory=lambda *args, **kwargs: TelegramClient(*args, **kwargs)
+    )
+
+
 async def login(cfg: dict) -> None:
     """Explicit interactive authorization, invoked only by the CLI."""
-    settings = cfg["telegram"]
-    Path(settings["session_name"]).parent.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(settings["session_name"], int(settings["api_id"]), settings["api_hash"])
-    try:
-        await client.start()
-    finally:
-        await client.disconnect()
-        path = Path(settings["session_name"] + ".session")
-        if path.exists() and os.name == "posix":
-            path.chmod(0o600)
+    await _account(cfg).login()

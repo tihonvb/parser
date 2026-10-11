@@ -9,21 +9,16 @@ from telethon import TelegramClient
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.types import Channel, Chat
 
+from lead_parser.infrastructure.integrations.telegram.client import TelegramAccount
 from lead_parser.infrastructure.security import safe_error
 
 QUERY_TOPICS = ["ремонт", "ремонт квартир", "строительство", "объявления услуги", "барахолка", "соседи"]
 
 
 async def find_candidates(cfg, report=None):
-    settings = cfg["telegram"]
-    client = TelegramClient(
-        settings["session_name"],
-        int(settings["api_id"]),
-        settings["api_hash"],
-        flood_sleep_threshold=0,
-        request_retries=1,
-        connection_retries=1,
-    )
+    client = TelegramAccount.from_config(
+        cfg, client_factory=lambda *args, **kwargs: TelegramClient(*args, **kwargs)
+    ).new_client()
     found = {}
     errors = []
     try:
