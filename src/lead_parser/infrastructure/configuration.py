@@ -11,6 +11,8 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from lead_parser.infrastructure.credentials import ENV_MAP  # one declaration per connector: credentials.py
+
 # Checkout commands retain their historical default even when invoked from elsewhere.
 # An installed wheel uses the caller's directory, with --config available explicitly.
 _CHECKOUT = Path(__file__).resolve().parents[3]
@@ -112,18 +114,6 @@ DEFAULTS = {
         "jobs_per_run": 100,
     },
     "discovery": {"city_id": None, "max_groups": 2000, "max_pages": 50, "days": 7},
-}
-
-ENV_MAP = {
-    "TELEGRAM_API_ID": ("telegram", "api_id"),
-    "TELEGRAM_API_HASH": ("telegram", "api_hash"),
-    "VK_ACCESS_TOKEN": ("vk", "access_token"),
-    "VK_SEARCH_TOKEN": ("vk", "search_token"),
-    "OPENROUTER_API_KEY": ("ai_filter", "openrouter_api_key"),
-    "GOOGLE_SERVICE_ACCOUNT_FILE": ("output", "google_sheets", "credentials_file"),
-    "GOOGLE_SPREADSHEET_ID": ("output", "google_sheets", "spreadsheet_id"),
-    "TELEGRAM_BOT_TOKEN": ("notifications", "telegram", "bot_token"),
-    "TELEGRAM_CHAT_ID": ("notifications", "telegram", "chat_id"),
 }
 
 

@@ -11,6 +11,7 @@ COMMANDS = {
     "discover": "discover",
     "vk-auth": "vk_token",
     "telegram-auth": "telegram_parser",
+    "connectors": "connectors",
     "migrate-sheet": "fix_sheet",
     "vk-discovery": "vk_discovery",
     "telegram-discovery": "telegram_discovery",

@@ -29,6 +29,7 @@ uv run --locked lead-parser --config config.yaml --check-config
 
 ## Настройка интеграций
 
+- **Креды коннекторов** объявлены в одном месте; `lead-parser connectors status` показывает, чего не хватает (только имена), а `connectors env-template` создаёт пустой `.env`. Подробно: [docs/connectors.md](docs/connectors.md).
 - **VK static:** `vk.enabled: true`, `token_mode: static`, `VK_ACCESS_TOKEN`, список `group_ids`. Принимаются положительные/отрицательные числа, `club123`, `public123`, короткие имена и ссылки `https://vk.com/...` / `https://vk.ru/...`. Файлы VK ID в этом режиме не нужны.
 - **VK ID:** `token_mode: vk_id`, собственный зарегистрированный `client_id` и разрешённый `redirect_uri`. Токен обновляется перед сбором в каждом цикле. YAML не переписывается; значение токена из файла используется в памяти. Права на методы зависят от приложения/профиля; получение токена не гарантирует доступ к `newsfeed.search`/`groups.search`. При необходимости задайте отдельный `VK_SEARCH_TOKEN`.
 - **Telegram MTProto:** `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, список `channels`. Один раз выполните `uv run --locked lead-parser telegram-auth login --config config.yaml` интерактивно. Плановый запуск подключает существующую сессию и не спрашивает телефон или код. Чужие/закрытые каналы могут быть недоступны.

@@ -49,10 +49,15 @@ class ConfiguredSource:
         return self.collector(self.cfg, store=state, reports=reports)
 
 
+# Lead sources by connector name. Each module provides ``collect_leads`` (see application.connectors.SourceCollector);
+# every name here has a ConnectorSpec in infrastructure/credentials.py (checked by tests).
+SOURCE_MODULES = {"telegram": telegram, "vk": vk, "avito": avito}
+
+
 def build_sources(cfg: dict) -> tuple[LeadSource, ...]:
     return tuple(
         ConfiguredSource(name, cfg, module.collect_leads)
-        for name, module in (("telegram", telegram), ("vk", vk), ("avito", avito))
+        for name, module in SOURCE_MODULES.items()
         if cfg[name]["enabled"]
     )
 
