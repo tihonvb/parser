@@ -55,11 +55,21 @@ def _uids(data) -> list[int]:
 
 
 def _uidvalidity(imap) -> int:
+    """imaplib's ``response()`` CLEARS the value it returns, so this must be read exactly once per SELECT
+    (use ``select_folder``); a second call would report 0 and silently disable the UID cursor."""
     try:
         _, values = imap.response("UIDVALIDITY")
         return int(values[0]) if values and values[0] else 0
     except (TypeError, ValueError, IndexError):
         return 0
+
+
+def select_folder(imap, folder: str) -> int:
+    """Open the folder read-only and return its UIDVALIDITY (read once, see ``_uidvalidity``)."""
+    status, _ = imap.select(folder, readonly=True)
+    if status != "OK":
+        raise MailError("FolderNotFound")
+    return _uidvalidity(imap)
 
 
 def _make_lead(mail: Mail, uid: int, cfg: dict) -> tuple[Lead | None, str]:
@@ -87,8 +97,7 @@ def _make_lead(mail: Mail, uid: int, cfg: dict) -> tuple[Lead | None, str]:
     )
 
 
-def _select_uids(imap, cursor: dict, settings: dict, now: datetime) -> list[int]:
-    validity = _uidvalidity(imap)
+def _select_uids(imap, cursor: dict, settings: dict, now: datetime, validity: int) -> list[int]:
     if cursor.get("uidvalidity") == validity and cursor.get("last_uid"):
         start = int(cursor["last_uid"]) + 1
         status, data = imap.uid("SEARCH", None, "UID", f"{start}:*")
@@ -104,14 +113,11 @@ def _select_uids(imap, cursor: dict, settings: dict, now: datetime) -> list[int]
 
 def _scan(imap, cfg: dict, store: CollectionState | None, result: ScanResult, now: datetime) -> list[Lead]:
     settings = cfg["profi_mail"]
-    status, _ = imap.select(settings["folder"], readonly=True)
-    if status != "OK":
-        raise MailError("FolderNotFound")
-    validity = _uidvalidity(imap)
+    validity = select_folder(imap, settings["folder"])
     previous = dict(
         result.cursor
     )  # seeded from the store before connecting, so a failure never resets progress
-    uids = _select_uids(imap, previous, settings, now)
+    uids = _select_uids(imap, previous, settings, now, validity)
     subject_filter = (
         re.compile(settings["subject_regex"], re.IGNORECASE) if settings["subject_regex"] else None
     )
