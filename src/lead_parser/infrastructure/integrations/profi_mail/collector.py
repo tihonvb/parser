@@ -22,10 +22,13 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
+import requests
+
 from lead_parser.application.models import ScanResult
 from lead_parser.application.ports import CollectionState
 from lead_parser.core.models import Lead
 from lead_parser.core.policies import extract_phone, keyword_decision
+from lead_parser.infrastructure.integrations.profi_mail import oauth
 from lead_parser.infrastructure.integrations.profi_mail.message import (
     Mail,
     domain_allowed,
@@ -160,6 +163,43 @@ def _scan(imap, cfg: dict, store: CollectionState | None, result: ScanResult, no
     return leads
 
 
+def connect(settings: dict, imap_factory: Callable = imaplib.IMAP4_SSL, oauth_http=requests):
+    """Open and authenticate an IMAP connection: password (app password) or OAuth2 (XOAUTH2).
+
+    Used by the collector and by the CLI so both authenticate identically. Raises ``MailError`` with a precise,
+    secret-free reason; never leaves a half-open connection behind."""
+    imap = imap_factory(settings["host"], settings["port"], timeout=settings["request_timeout_seconds"])
+    try:
+        if settings["auth"] == "oauth2":
+            options = settings["oauth"]
+            try:
+                token = oauth.access_token(options, oauth.TokenFile(options["token_file"]), oauth_http)
+            except oauth.OAuthError as error:
+                raise MailError(f"AuthFailed:{error}") from None
+            imap.authenticate("XOAUTH2", lambda _challenge: oauth.xoauth2(settings["username"], token))
+        else:
+            imap.login(settings["username"], settings["password"])
+    except imaplib.IMAP4.error as error:
+        _quiet_logout(imap)
+        hint = (
+            "the server rejected the OAuth2 token: run `lead-parser profi-mail login` and check the app permissions"
+            if settings["auth"] == "oauth2"
+            else "check username, app password and that IMAP is enabled"
+        )
+        raise MailError(f"AuthFailed:{hint}") from error
+    except MailError:
+        _quiet_logout(imap)
+        raise
+    return imap
+
+
+def _quiet_logout(imap) -> None:
+    try:
+        imap.logout()
+    except Exception:
+        pass
+
+
 def collect_leads(
     cfg: dict,
     store: CollectionState | None = None,
@@ -167,6 +207,7 @@ def collect_leads(
     *,
     imap_factory: Callable = imaplib.IMAP4_SSL,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    oauth_http=requests,
 ) -> list[Lead]:
     settings = cfg["profi_mail"]
     if not settings["enabled"]:
@@ -176,13 +217,7 @@ def collect_leads(
     leads: list[Lead] = []
     imap = None
     try:
-        try:
-            imap = imap_factory(
-                settings["host"], settings["port"], timeout=settings["request_timeout_seconds"]
-            )
-            imap.login(settings["username"], settings["password"])
-        except imaplib.IMAP4.error as error:
-            raise MailError("AuthFailed:check username, app password and that IMAP is enabled") from error
+        imap = connect(settings, imap_factory, oauth_http)
         leads = _scan(imap, cfg, store, result, clock())
     except Exception as error:
         result.fail(str(error) if isinstance(error, MailError) else safe_error(error))

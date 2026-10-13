@@ -46,6 +46,48 @@ lead-parser --check-config --config config.yaml
 
 Если писем нет, `status` подскажет включить уведомления на стороне Профи.ру.
 
+## Outlook.com / Microsoft 365 (OAuth2, без пароля)
+
+Microsoft отключила вход по паролю в IMAP: сервер отвечает «Basic authentication is disabled», принимается только OAuth2. Коннектор поддерживает его через *device code flow*: **пароль ящика не вводится и не хранится нигде**, вы один раз подтверждаете вход в браузере, а токены обновляются автоматически.
+
+### 1. Зарегистрировать приложение (один раз, бесплатно)
+1. Откройте <https://entra.microsoft.com> → **Identity → Applications → App registrations → New registration** (то же доступно в portal.azure.com). Для личной учётной записи Microsoft портал может предложить завершить бесплатную регистрацию каталога, платить за регистрацию приложения не нужно.
+2. Название любое (`lead-parser`). **Supported account types:** *Accounts in any organizational directory and personal Microsoft accounts*. Redirect URI оставьте пустым.
+3. **Authentication → Advanced settings → Allow public client flows = Yes** → Save.
+4. **API permissions → Add a permission → APIs my organization uses → Office 365 Exchange Online → Delegated permissions → `IMAP.AccessAsUser.All`** → Add. (Согласие даётся при первом входе.)
+5. На странице *Overview* скопируйте **Application (client) ID**. Это не секрет, client secret не нужен.
+
+### 2. Конфигурация
+
+```yaml
+profi_mail:
+  enabled: true
+  host: outlook.office365.com        # для личных ящиков подходит и imap-mail.outlook.com
+  username: you@outlook.com
+  auth: oauth2
+  oauth:
+    client_id: 'ВАШ_APPLICATION_CLIENT_ID'   # или переменная PROFI_MAIL_OAUTH_CLIENT_ID
+    tenant: consumers                         # личные ящики; для рабочего Microsoft 365 — ID каталога или organizations
+```
+
+### 3. Войти и проверить
+
+```bash
+lead-parser profi-mail login      # покажет адрес и короткий код: откройте в браузере, войдите в ящик, подтвердите
+lead-parser profi-mail status     # вход, папка, число писем от profi.ru в окне
+```
+
+Токены сохраняются в `.data/profi_mail_oauth.json` (права `0600`, запись атомарная). Перед каждым запуском токен при необходимости обновляется, а новый refresh-токен записывается раньше, чем используется. Если доступ отозван или истёк, отчёт прогона скажет `AuthFailed: … run lead-parser profi-mail login`.
+
+| Ситуация | Что видно |
+| --- | --- |
+| Нет входа | `NotLoggedIn: run lead-parser profi-mail login` |
+| Доступ отозван / срок вышел | `invalid_grant: … run lead-parser profi-mail login` |
+| Приложение не найдено / не разрешён public client | `unauthorized_client` / `invalid_client` и первая строка описания от Microsoft |
+| Сервер отверг токен | `AuthFailed: the server rejected the OAuth2 token …` |
+
+> Токены и коды в отчётах и логах не печатаются (выводится только одноразовый код входа, который нужен вам для браузера).
+
 ## Как разбирается письмо
 
 Шаблон письма заранее неизвестен, поэтому разбор не завязан на разметку:

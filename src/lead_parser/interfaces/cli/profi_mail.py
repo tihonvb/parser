@@ -1,5 +1,6 @@
 """Check and calibrate the Profi.ru mailbox connector (read-only).
 
+    lead-parser profi-mail login                       # Outlook / Microsoft 365: sign in via browser (OAuth2), no password
     lead-parser profi-mail status                      # can we log in; how many Profi.ru mails in the window
     lead-parser profi-mail inspect [--count 1] [--out FILE] [--raw-out FILE]
                                                        # masked structure of the latest matching mails
@@ -14,14 +15,19 @@ import argparse
 import imaplib
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import requests
+
 from lead_parser.infrastructure.configuration import CONFIG_PATH, load_config
+from lead_parser.infrastructure.integrations.profi_mail import oauth
 from lead_parser.infrastructure.integrations.profi_mail.collector import (
     MailError,
     _select_uids,
     _uidvalidity,
+    connect,
 )
 from lead_parser.infrastructure.integrations.profi_mail.message import (
     domain_allowed,
@@ -35,15 +41,15 @@ from lead_parser.infrastructure.security import safe_error
 EXIT_OK, EXIT_NOT_READY = 0, 2
 
 
-def _open(cfg: dict, imap_factory):
+def _open(cfg: dict, imap_factory, oauth_http=requests):
     settings = cfg["profi_mail"]
-    if not (settings["host"] and settings["username"] and settings["password"]):
-        raise MailError("NotConfigured:set profi_mail.host, username and PROFI_MAIL_PASSWORD")
-    try:
-        imap = imap_factory(settings["host"], settings["port"], timeout=settings["request_timeout_seconds"])
-        imap.login(settings["username"], settings["password"])
-    except imaplib.IMAP4.error as error:
-        raise MailError("AuthFailed:check username, app password and that IMAP is enabled") from error
+    credentials = settings["password"] if settings["auth"] == "password" else settings["oauth"]["client_id"]
+    if not (settings["host"] and settings["username"] and credentials):
+        raise MailError(
+            "NotConfigured:set profi_mail.host, username and "
+            + ("PROFI_MAIL_PASSWORD" if settings["auth"] == "password" else "oauth.client_id")
+        )
+    imap = connect(settings, imap_factory, oauth_http)
     status, _ = imap.select(settings["folder"], readonly=True)
     if status != "OK":
         imap.logout()
@@ -63,9 +69,35 @@ def _profi_uids(imap, cfg: dict) -> list[int]:
     return found
 
 
-def status(cfg: dict, imap_factory=imaplib.IMAP4_SSL) -> int:
+def login(cfg: dict, http=requests, sleep=time.sleep, clock=time.time, out=print) -> int:
+    """Device-code sign-in for Outlook / Microsoft 365: you approve in a browser, we store only tokens."""
+    settings = cfg["profi_mail"]
+    options = settings["oauth"]
+    if not options["client_id"].strip():
+        out(
+            "Not ready: set profi_mail.oauth.client_id (or PROFI_MAIL_OAUTH_CLIENT_ID); see docs/profi-mail.md."
+        )
+        return EXIT_NOT_READY
     try:
-        imap = _open(cfg, imap_factory)
+        code = oauth.start_device_flow(options, http)
+        out(f"Open {code.verification_uri} in any browser and enter the code: {code.user_code}")
+        out(
+            f"Sign in to {settings['username'] or 'your mailbox'} and approve access. Waiting up to {code.expires_in // 60} min..."
+        )
+        tokens = oauth.wait_for_tokens(options, code, http, sleep, clock)
+        oauth.TokenFile(options["token_file"]).save(tokens)
+    except oauth.OAuthError as error:
+        out(f"Not ready: {error}")
+        return EXIT_NOT_READY
+    out(
+        f"Signed in. Tokens saved: {options['token_file']} (owner-only). Set profi_mail.auth: oauth2 and enabled: true."
+    )
+    return EXIT_OK
+
+
+def status(cfg: dict, imap_factory=imaplib.IMAP4_SSL, oauth_http=requests) -> int:
+    try:
+        imap = _open(cfg, imap_factory, oauth_http)
     except (MailError, OSError) as error:
         print(f"Not ready: {error if isinstance(error, MailError) else safe_error(error)}")
         return EXIT_NOT_READY
@@ -89,9 +121,16 @@ def status(cfg: dict, imap_factory=imaplib.IMAP4_SSL) -> int:
                 pass
 
 
-def inspect(cfg: dict, count: int, out: Path, raw_out: Path | None, imap_factory=imaplib.IMAP4_SSL) -> int:
+def inspect(
+    cfg: dict,
+    count: int,
+    out: Path,
+    raw_out: Path | None,
+    imap_factory=imaplib.IMAP4_SSL,
+    oauth_http=requests,
+) -> int:
     try:
-        imap = _open(cfg, imap_factory)
+        imap = _open(cfg, imap_factory, oauth_http)
     except (MailError, OSError) as error:
         print(f"Not ready: {error if isinstance(error, MailError) else safe_error(error)}")
         return EXIT_NOT_READY
@@ -136,13 +175,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("command", choices=["status", "inspect"])
+    parser.add_argument("command", choices=["login", "status", "inspect"])
     parser.add_argument("--config", default=str(CONFIG_PATH))
     parser.add_argument("--count", type=int, default=1, help="inspect: how many latest mails")
     parser.add_argument("--out", default="profi-mail-skeleton.txt")
     parser.add_argument("--raw-out", help="inspect: also save the readable text here (owner-only)")
     args = parser.parse_args(argv)
     cfg = load_config(args.config, require_access=False)
+    if args.command == "login":
+        return login(cfg)
     if args.command == "status":
         return status(cfg)
     return inspect(cfg, max(1, args.count), Path(args.out), Path(args.raw_out) if args.raw_out else None)

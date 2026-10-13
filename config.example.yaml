@@ -58,6 +58,12 @@ profi_mail:
   port: 993
   username: ''
   password: ''
+  auth: password                 # password (пароль приложения) | oauth2 (Outlook / Microsoft 365)
+  oauth:
+    client_id: ''
+    tenant: consumers
+    scope: https://outlook.office.com/IMAP.AccessAsUser.All offline_access
+    token_file: .data/profi_mail_oauth.json
   folder: INBOX
   sender_domains: [profi.ru]
   subject_regex: ''

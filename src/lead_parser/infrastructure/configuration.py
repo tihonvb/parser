@@ -83,6 +83,13 @@ DEFAULTS = {
         "port": 993,
         "username": "",
         "password": "",
+        "auth": "password",
+        "oauth": {
+            "client_id": "",
+            "tenant": "consumers",
+            "scope": "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+            "token_file": ".data/profi_mail_oauth.json",
+        },
         "folder": "INBOX",
         "sender_domains": ["profi.ru"],
         "subject_regex": "",
@@ -144,6 +151,7 @@ ENV_MAP = {
     "TELEGRAM_BOT_TOKEN": ("notifications", "telegram", "bot_token"),
     "TELEGRAM_CHAT_ID": ("notifications", "telegram", "chat_id"),
     "PROFI_MAIL_PASSWORD": ("profi_mail", "password"),
+    "PROFI_MAIL_OAUTH_CLIENT_ID": ("profi_mail", "oauth", "client_id"),
 }
 
 
@@ -375,6 +383,13 @@ def _validate_profi_mail_static(mail: dict) -> None:
         if not isinstance(mail[key], str):
             raise ConfigError(f"profi_mail.{key}: expected string")
         _compile(key, mail[key])
+    if mail["auth"] not in {"password", "oauth2"}:
+        raise ConfigError("profi_mail.auth: expected 'password' or 'oauth2'")
+    if not re.fullmatch(r"consumers|common|organizations|[A-Za-z0-9.-]+", str(mail["oauth"]["tenant"])):
+        raise ConfigError("profi_mail.oauth.tenant: expected consumers, common, organizations or a tenant id")
+    for key in ("scope", "token_file"):
+        if not isinstance(mail["oauth"][key], str) or not mail["oauth"][key].strip():
+            raise ConfigError(f"profi_mail.oauth.{key}: must not be empty")
     _compile("link_pattern", mail["link_pattern"])
     _compile("order_id_pattern", mail["order_id_pattern"], groups=1)
     if not 1 <= mail["port"] <= 65535 or mail["lookback_days"] > 60 or mail["max_messages_per_run"] > 5000:
@@ -386,9 +401,12 @@ def _validate_profi_mail_static(mail: dict) -> None:
 def _validate_profi_mail_enabled(mail: dict) -> None:
     if not mail["enabled"]:
         return
-    for key in ("host", "username", "password", "folder"):
+    required = ["host", "username", "folder"] + (["password"] if mail["auth"] == "password" else [])
+    for key in required:
         if not _filled(mail[key]):
             raise ConfigError(f"profi_mail.{key}: required when enabled (password: PROFI_MAIL_PASSWORD)")
+    if mail["auth"] == "oauth2" and not _filled(mail["oauth"]["client_id"]):
+        raise ConfigError("profi_mail.oauth.client_id: required for auth: oauth2 (docs/profi-mail.md)")
 
 
 def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) -> dict[str, Any]:
@@ -428,6 +446,10 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
                 raise ConfigError(section + "." + key + ": empty path")
             candidate = Path(cfg[section][key]).expanduser()
             cfg[section][key] = str(candidate if candidate.is_absolute() else path.parent / candidate)
+    token_file = Path(cfg["profi_mail"]["oauth"]["token_file"]).expanduser()
+    cfg["profi_mail"]["oauth"]["token_file"] = str(
+        token_file if token_file.is_absolute() else path.parent / token_file
+    )
     creds = Path(cfg["output"]["google_sheets"]["credentials_file"]).expanduser()
     cfg["output"]["google_sheets"]["credentials_file"] = str(
         creds if creds.is_absolute() else path.parent / creds
