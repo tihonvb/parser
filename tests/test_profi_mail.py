@@ -179,10 +179,12 @@ class FakeIMAP:
     def select(self, folder, readonly=False):
         self.readonly = readonly
         self.log.append(f"SELECT {folder}")
+        self._untagged = {"UIDVALIDITY": [str(self.uidvalidity).encode()]}
         return ("OK" if folder != "NOPE" else "NO"), [b"1"]
 
     def response(self, code):
-        return code, [str(self.uidvalidity).encode()]
+        """Like imaplib: the returned value is CLEARED, so a second read gives [None]."""
+        return code, self._untagged.pop(code, [None])
 
     def uid(self, command, *args):
         self.log.append(f"UID {command} {args}")
@@ -320,6 +322,18 @@ def test_leads_are_stored_before_the_cursor_moves():
     store = Store()
     run(config(), {1: mail(1)}, store=store)
     assert store.events.index(("ingest", 1)) < store.events.index("checkpoint")
+
+
+def test_uidvalidity_is_read_once_per_select_like_real_imaplib():
+    store = Store()
+    run(config(), {1: mail(1)}, store=store)
+    assert (
+        store.cursors["profi:mail:INBOX"]["uidvalidity"] == 7
+    )  # not 0: the second read would have returned 0
+    _, imap = run(config(), {1: mail(1), 2: mail(2)}, store=store)
+    assert not any(
+        "SINCE" in entry for entry in imap.log
+    )  # the cursor was honoured, the window was not re-read
 
 
 def test_uidvalidity_change_resets_the_cursor_to_the_lookback_window():

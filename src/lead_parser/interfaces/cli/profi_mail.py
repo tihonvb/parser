@@ -26,8 +26,8 @@ from lead_parser.infrastructure.integrations.profi_mail import oauth
 from lead_parser.infrastructure.integrations.profi_mail.collector import (
     MailError,
     _select_uids,
-    _uidvalidity,
     connect,
+    select_folder,
 )
 from lead_parser.infrastructure.integrations.profi_mail.message import (
     domain_allowed,
@@ -50,18 +50,19 @@ def _open(cfg: dict, imap_factory, oauth_http=requests):
             + ("PROFI_MAIL_PASSWORD" if settings["auth"] == "password" else "oauth.client_id")
         )
     imap = connect(settings, imap_factory, oauth_http)
-    status, _ = imap.select(settings["folder"], readonly=True)
-    if status != "OK":
+    try:
+        validity = select_folder(imap, settings["folder"])
+    except MailError:
         imap.logout()
-        raise MailError("FolderNotFound:" + settings["folder"])
-    return imap
+        raise MailError("FolderNotFound:" + settings["folder"]) from None
+    return imap, validity
 
 
-def _profi_uids(imap, cfg: dict) -> list[int]:
+def _profi_uids(imap, cfg: dict, validity: int) -> list[int]:
     """UIDs of mails from the configured sender domains in the lookback window (headers only)."""
     settings = cfg["profi_mail"]
     found = []
-    for uid in _select_uids(imap, {}, settings, datetime.now(UTC)):
+    for uid in _select_uids(imap, {}, settings, datetime.now(UTC), validity):
         _, parts = imap.uid("FETCH", str(uid), "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
         raw = next((part[1] for part in parts if isinstance(part, tuple)), b"")
         if domain_allowed(parse_mail(raw + b"\r\n").sender_domain, settings["sender_domains"]):
@@ -97,14 +98,14 @@ def login(cfg: dict, http=requests, sleep=time.sleep, clock=time.time, out=print
 
 def status(cfg: dict, imap_factory=imaplib.IMAP4_SSL, oauth_http=requests) -> int:
     try:
-        imap = _open(cfg, imap_factory, oauth_http)
+        imap, validity = _open(cfg, imap_factory, oauth_http)
     except (MailError, OSError) as error:
         print(f"Not ready: {error if isinstance(error, MailError) else safe_error(error)}")
         return EXIT_NOT_READY
     try:
         settings = cfg["profi_mail"]
-        matching = _profi_uids(imap, cfg)
-        print(f"Mailbox OK: {settings['folder']}, UIDVALIDITY {_uidvalidity(imap)}.")
+        matching = _profi_uids(imap, cfg, validity)
+        print(f"Mailbox OK: {settings['folder']}, UIDVALIDITY {validity}.")
         print(
             f"Mail from {', '.join(settings['sender_domains'])} in the last {settings['lookback_days']} days: {len(matching)}."
         )
@@ -130,14 +131,14 @@ def inspect(
     oauth_http=requests,
 ) -> int:
     try:
-        imap = _open(cfg, imap_factory, oauth_http)
+        imap, validity = _open(cfg, imap_factory, oauth_http)
     except (MailError, OSError) as error:
         print(f"Not ready: {error if isinstance(error, MailError) else safe_error(error)}")
         return EXIT_NOT_READY
     settings = cfg["profi_mail"]
     masked, raw = [], []
     try:
-        for uid in _profi_uids(imap, cfg)[-count:]:
+        for uid in _profi_uids(imap, cfg, validity)[-count:]:
             _, parts = imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
             mail = parse_mail(next(p[1] for p in parts if isinstance(p, tuple)))
             order_id, url = order_link(mail.links, settings["link_pattern"], settings["order_id_pattern"])

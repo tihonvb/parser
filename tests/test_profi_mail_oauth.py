@@ -243,10 +243,11 @@ class FakeIMAP:
         return "OK", [b"ok"]
 
     def select(self, folder, readonly=False):
+        self._untagged = {"UIDVALIDITY": [b"7"]}
         return "OK", [b"0"]
 
     def response(self, code):
-        return code, [b"7"]
+        return code, self._untagged.pop(code, [None])  # like imaplib: the value is cleared when read
 
     def uid(self, command, *args):
         return "OK", [b""]
