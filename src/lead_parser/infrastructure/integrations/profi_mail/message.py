@@ -122,16 +122,28 @@ def domain_allowed(domain: str, allowed: list[str]) -> bool:
     return any(domain == item.lower() or domain.endswith("." + item.lower()) for item in allowed)
 
 
-_ID_PARAMS = {"id", "order", "order_id", "orderid", "oid"}
+_ID_PARAMS = ("o", "id", "order", "order_id", "orderid", "oid")  # "o" is Profi.ru's own order link parameter
+_TRACKER_PREFIXES = ("/api/",)  # click trackers: their "id" is a click number and the link signs the user in
+
+
+def _raw_pair(query: str, name: str) -> str:
+    """The query pair ``name=...`` exactly as written (encoding preserved)."""
+    for pair in query.split("&"):
+        if pair.split("=", 1)[0] == name:
+            return pair
+    return ""
 
 
 def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[str, str]:
-    """(order id, canonical https URL) of the first profi.ru link that carries an order number.
+    """(order id, canonical https URL) of the first profi.ru link that points at an order.
 
-    The number is looked for in the path first, then in the query string (preferred parameter names first, and
-    only a value that matches ``id_pattern`` as a whole). The canonical link keeps ONLY that parameter: the other
-    query parameters of notification links are tracking or sign-in tokens and must never be copied to Telegram
-    or the sheet."""
+    * Click trackers (``/api/...``) are never used: their ``id`` is a click number, and following one signs
+      the user in (it redirects with a login token), so it must not be published either.
+    * The order number is looked for in the path first, then in the query string: preferred parameters
+      (``o``, ``id``, ``order`` ...) first. Profi.ru's own link is ``/backoffice/n.php?o=<number>|||<kind>``:
+      for the ``o`` parameter the number is the digits at the start of the value.
+    * The canonical link keeps ONLY the parameter that carries the number, with its original encoding: the
+      other parameters are tracking or sign-in tokens and must never be copied to Telegram or the sheet."""
     wanted = re.compile(link_pattern)
     pattern = re.compile(id_pattern)
     for link in links:
@@ -141,16 +153,27 @@ def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[st
         host = parts.hostname or ""
         if parts.scheme != "https" or not (host == "profi.ru" or host.endswith(".profi.ru")):
             continue
+        if parts.path.startswith(_TRACKER_PREFIXES):
+            continue
         base = f"https://{host}{parts.path}"
         found = pattern.search(parts.path)
         if found:
             return found.group(1), base
-        params = sorted(parse_qsl(parts.query), key=lambda item: item[0].lower() not in _ID_PARAMS)
+        params = sorted(parse_qsl(parts.query), key=lambda item: _rank(item[0]))
         for name, value in params:
-            matched = pattern.fullmatch(value)
+            if name.lower() not in _ID_PARAMS:
+                matched = pattern.fullmatch(value)  # unknown parameter: the whole value must be the number
+            else:
+                matched = pattern.match(value)  # known parameter: the number may be followed by a suffix
             if matched:
-                return matched.group(1), f"{base}?{urlencode({name: value})}"
+                raw = _raw_pair(parts.query, name) or urlencode({name: value})
+                return matched.group(1), f"{base}?{raw}"
     return "", ""
+
+
+def _rank(name: str) -> int:
+    name = name.lower()
+    return _ID_PARAMS.index(name) if name in _ID_PARAMS else len(_ID_PARAMS)
 
 
 def lead_text(mail: Mail, start_regex: str, end_regex: str) -> str:

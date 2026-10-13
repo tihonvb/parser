@@ -644,3 +644,57 @@ def test_lead_from_a_notification_has_a_clean_link_and_no_tokens_anywhere():
 
 def test_html_entities_in_plain_text_are_decoded():
     assert "м² & «x»" in parse_mail(build(body="м&#178; &amp; &laquo;x&raquo;")).text
+
+
+# ---------------------------------------------------------------- the real Profi.ru notification (click trackers + direct link)
+
+TRACKER = "https://profi.ru/api/xmail/clck/?id=12527769227&hsh=a123b4567c8de90&hrf=https://profi.ru/orders&hrf_hash=x1y22222222z3w44v55uuu66"
+DIRECT = "https://profi.ru/backoffice/n.php?o=12345678|||new-ru&sub1=email&sub2=87654321&sub3=abcd&fromSection=email"
+REAL_LINKS = [
+    TRACKER,
+    "https://b.profi.ru/qSkqHNsllIntNJRq",
+    TRACKER,
+    DIRECT,
+    "https://profi.ru/backoffice/a.php?notification_settings=true|||x",
+]
+
+
+def test_click_trackers_are_never_used_and_the_direct_order_link_is():
+    assert (
+        order_link(REAL_LINKS, LINK_RE, ID_RE)
+        == (
+            "12345678",
+            "https://profi.ru/backoffice/n.php?o=12345678|||new-ru",  # the encoding is kept, other parameters dropped
+        )
+    )
+
+
+def test_only_trackers_means_no_order_link_rather_than_a_wrong_one():
+    assert order_link([TRACKER, "https://b.profi.ru/qSkqHNsllIntNJRq"], LINK_RE, ID_RE) == ("", "")
+
+
+def test_the_number_of_a_known_parameter_may_be_followed_by_a_suffix_but_unknown_ones_must_be_numbers():
+    assert order_link(["https://profi.ru/x/view/?o=55555555|||kind"], LINK_RE, ID_RE)[0] == "55555555"
+    assert order_link(["https://profi.ru/x/view/?zz=55555555|||kind"], LINK_RE, ID_RE)[0] == ""
+    assert order_link(["https://profi.ru/x/view/?zz=55555555"], LINK_RE, ID_RE)[0] == "55555555"
+
+
+def test_real_notification_end_to_end_has_a_working_link_and_leaks_no_tokens():
+    body = "Новый заказ: нужен ремонт\n" + "\n".join(REAL_LINKS)
+    leads, _ = run(config(), {1: build(body=body, message_id="<real@profi.ru>")})
+    (lead,) = leads
+    assert (
+        lead.external_id == "12345678" and lead.url == "https://profi.ru/backoffice/n.php?o=12345678|||new-ru"
+    )
+    everything = " ".join([lead.text, lead.url, str(lead.extra)])
+    for secret in ("hsh=", "hrf", "a123b4567c8de90", "clck", "12527769227", "sub2", "87654321"):
+        assert secret not in everything, secret
+
+
+def test_html_notification_with_ampersand_escaped_hrefs():
+    html = f'<p>Новый заказ: нужен ремонт</p><a href="{TRACKER.replace("&", "&amp;")}">Открыть</a><a href="{DIRECT.replace("&", "&amp;")}">Заказ</a>'
+    msg = EmailMessage()
+    msg["From"], msg["Subject"], msg["Message-ID"] = "noreply@profi.ru", "Новый заказ", "<h@profi.ru>"
+    msg.set_content(html, subtype="html")
+    mail_obj = parse_mail(msg.as_bytes())
+    assert order_link(mail_obj.links, LINK_RE, ID_RE)[0] == "12345678"
