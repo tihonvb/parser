@@ -88,6 +88,8 @@ DEFAULTS = {
         "subject_regex": "",
         "exclude_subject_regex": "",
         "keyword_filter": True,
+        "link_mode": "direct",
+        "button_regex": "посмотреть заказ|открыть заказ|смотреть заказ",
         "lookback_days": 3,
         "max_messages_per_run": 200,
         "request_timeout_seconds": 30,
@@ -371,6 +373,9 @@ def _validate_profi_mail_static(mail: dict) -> None:
         raise ConfigError(
             "profi_mail.sender_domains: expected a list of domains like profi.ru (empty = any sender)"
         )
+    if mail["link_mode"] not in {"direct", "button"}:
+        raise ConfigError("profi_mail.link_mode: expected 'direct' or 'button'")
+    _compile("button_regex", mail["button_regex"])
     if type(mail["keyword_filter"]) is not bool:
         raise ConfigError("profi_mail.keyword_filter: expected boolean")
     for key in ("subject_regex", "exclude_subject_regex", "body_start_regex", "body_end_regex"):

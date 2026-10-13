@@ -31,7 +31,9 @@ class _HtmlText(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.chunks: list[str] = []
         self.links: list[str] = []
+        self.anchors: list[tuple[str, str]] = []  # (visible text of the link, href): the buttons of the mail
         self._skip = 0
+        self._anchor: list | None = None
 
     def handle_starttag(self, tag, attrs) -> None:
         if tag in _SKIPPED_TAGS:
@@ -42,8 +44,14 @@ class _HtmlText(HTMLParser):
             href = dict(attrs).get("href")
             if href:
                 self.links.append(href)
+            self._anchor = [href or "", ""]
 
     def handle_endtag(self, tag) -> None:
+        if tag == "a" and self._anchor is not None:
+            text = " ".join(self._anchor[1].split())
+            if self._anchor[0]:
+                self.anchors.append((text, self._anchor[0]))
+            self._anchor = None
         if tag in _SKIPPED_TAGS and self._skip:
             self._skip -= 1
         if tag in _BLOCK_TAGS:
@@ -52,13 +60,20 @@ class _HtmlText(HTMLParser):
     def handle_data(self, data) -> None:
         if not self._skip:
             self.chunks.append(data)
+            if self._anchor is not None:
+                self._anchor[1] += data
 
 
 def html_to_text(html: str) -> tuple[str, list[str]]:
+    text, links, _ = html_parts(html)
+    return text, links
+
+
+def html_parts(html: str) -> tuple[str, list[str], list[tuple[str, str]]]:
     parser = _HtmlText()
     parser.feed(html)
     parser.close()
-    return "".join(parser.chunks), parser.links
+    return "".join(parser.chunks), parser.links, parser.anchors
 
 
 @dataclass
@@ -70,6 +85,9 @@ class Mail:
     text: str
     links: list[str] = field(default_factory=list)
     authentication_failed: bool = False
+    buttons: list[tuple[str, str]] = field(
+        default_factory=list
+    )  # (caption, href) of the links of the HTML part
 
 
 def _clean(text: str) -> str:
@@ -98,8 +116,9 @@ def parse_mail(raw: bytes) -> Mail:
             plain.get_content()
         )  # the plain part may carry literal HTML entities (&#178;)
         links.extend(_URL.findall(body))
+    buttons: list[tuple[str, str]] = []
     if html is not None:
-        html_text, hrefs = html_to_text(html.get_content())
+        html_text, hrefs, buttons = html_parts(html.get_content())
         links = hrefs + links
         if not body.strip():
             body = html_text
@@ -110,6 +129,7 @@ def parse_mail(raw: bytes) -> Mail:
         message_id=str(message.get("Message-ID", "")).strip(),
         text=_clean(body),
         links=[link.rstrip(".,;)>]\"'") for link in links],
+        buttons=buttons,
         authentication_failed=bool(re.search(r"\b(?:dkim|spf|dmarc)=(?:fail|softfail|permerror)\b", results)),
     )
 
@@ -126,12 +146,19 @@ _ID_PARAMS = ("o", "id", "order", "order_id", "orderid", "oid")  # "o" is Profi.
 _TRACKER_PREFIXES = ("/api/",)  # click trackers: their "id" is a click number and the link signs the user in
 
 
-def _raw_pair(query: str, name: str) -> str:
-    """The query pair ``name=...`` exactly as written (encoding preserved)."""
+# Parameters that look like secrets or tracking are never copied into a lead; routing parameters
+# (sub1/sub2/... fromSection) are kept because the Profi.ru app needs them to open the order.
+_SECRET_NAME = re.compile(r"(?i)tok|tkn|sig|hash|hsh|hmac|auth|pass|secret|key|sess|code|^utm|^_")
+
+
+def _clean_query(query: str, keep_name: str) -> str:
+    """The query exactly as written (encoding preserved), without secret-looking or tracking parameters."""
+    kept = []
     for pair in query.split("&"):
-        if pair.split("=", 1)[0] == name:
-            return pair
-    return ""
+        name = pair.split("=", 1)[0]
+        if name == keep_name or (name and not _SECRET_NAME.search(name)):
+            kept.append(pair)
+    return "&".join(kept)
 
 
 def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[str, str]:
@@ -142,8 +169,10 @@ def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[st
     * The order number is looked for in the path first, then in the query string: preferred parameters
       (``o``, ``id``, ``order`` ...) first. Profi.ru's own link is ``/backoffice/n.php?o=<number>|||<kind>``:
       for the ``o`` parameter the number is the digits at the start of the value.
-    * The canonical link keeps ONLY the parameter that carries the number, with its original encoding: the
-      other parameters are tracking or sign-in tokens and must never be copied to Telegram or the sheet."""
+    * The canonical link keeps the parameters of the link exactly as written, except those whose names look
+      like secrets (token, sig, hash, auth ...) or tracking (utm_*, _*): those must never be copied to Telegram or
+      the sheet. Routing parameters such as ``sub1=order&sub2=<number>`` are kept — without them the Profi.ru
+      app opens the cabinet but cannot load the order."""
     wanted = re.compile(link_pattern)
     pattern = re.compile(id_pattern)
     for link in links:
@@ -166,14 +195,30 @@ def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[st
             else:
                 matched = pattern.match(value)  # known parameter: the number may be followed by a suffix
             if matched:
-                raw = _raw_pair(parts.query, name) or urlencode({name: value})
-                return matched.group(1), f"{base}?{raw}"
+                query = _clean_query(parts.query, name) or urlencode({name: value})
+                return matched.group(1), f"{base}?{query}"
     return "", ""
 
 
 def _rank(name: str) -> int:
     name = name.lower()
     return _ID_PARAMS.index(name) if name in _ID_PARAMS else len(_ID_PARAMS)
+
+
+def button_link(buttons: list[tuple[str, str]], caption_regex: str) -> str:
+    """The https profi.ru address behind the mail button whose caption matches (e.g. «Посмотреть заказ»).
+
+    CAUTION: such a button usually opens the order AND signs the user in (the redirect carries a login token),
+    so publishing it gives whoever reads the Telegram chat / sheet access to the specialist's cabinet."""
+    wanted = re.compile(caption_regex, re.IGNORECASE)
+    for caption, href in buttons:
+        if not wanted.search(caption):
+            continue
+        parts = urlsplit(href.strip())
+        host = parts.hostname or ""
+        if parts.scheme == "https" and (host == "profi.ru" or host.endswith(".profi.ru")):
+            return href.strip()
+    return ""
 
 
 def lead_text(mail: Mail, start_regex: str, end_regex: str) -> str:

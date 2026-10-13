@@ -11,6 +11,7 @@ from lead_parser.infrastructure.configuration import DEFAULTS, ConfigError, vali
 from lead_parser.infrastructure.integrations.profi_mail import collector as mail_collector
 from lead_parser.infrastructure.integrations.profi_mail.collector import imap_date
 from lead_parser.infrastructure.integrations.profi_mail.message import (
+    button_link,
     domain_allowed,
     fallback_id,
     lead_text,
@@ -649,7 +650,7 @@ def test_html_entities_in_plain_text_are_decoded():
 # ---------------------------------------------------------------- the real Profi.ru notification (click trackers + direct link)
 
 TRACKER = "https://profi.ru/api/xmail/clck/?id=12527769227&hsh=a123b4567c8de90&hrf=https://profi.ru/orders&hrf_hash=x1y22222222z3w44v55uuu66"
-DIRECT = "https://profi.ru/backoffice/n.php?o=12345678|||new-ru&sub1=email&sub2=87654321&sub3=abcd&fromSection=email"
+DIRECT = "https://profi.ru/backoffice/n.php?o=12345678|||backoffice-react-app://&sub1=order&sub2=12345678&sub3=pinv&fromSection=Email"
 REAL_LINKS = [
     TRACKER,
     "https://b.profi.ru/qSkqHNsllIntNJRq",
@@ -660,12 +661,9 @@ REAL_LINKS = [
 
 
 def test_click_trackers_are_never_used_and_the_direct_order_link_is():
-    assert (
-        order_link(REAL_LINKS, LINK_RE, ID_RE)
-        == (
-            "12345678",
-            "https://profi.ru/backoffice/n.php?o=12345678|||new-ru",  # the encoding is kept, other parameters dropped
-        )
+    assert order_link(REAL_LINKS, LINK_RE, ID_RE) == (
+        "12345678",
+        DIRECT,  # routing parameters and the original encoding are kept
     )
 
 
@@ -683,11 +681,9 @@ def test_real_notification_end_to_end_has_a_working_link_and_leaks_no_tokens():
     body = "Новый заказ: нужен ремонт\n" + "\n".join(REAL_LINKS)
     leads, _ = run(config(), {1: build(body=body, message_id="<real@profi.ru>")})
     (lead,) = leads
-    assert (
-        lead.external_id == "12345678" and lead.url == "https://profi.ru/backoffice/n.php?o=12345678|||new-ru"
-    )
+    assert lead.external_id == "12345678" and lead.url == DIRECT
     everything = " ".join([lead.text, lead.url, str(lead.extra)])
-    for secret in ("hsh=", "hrf", "a123b4567c8de90", "clck", "12527769227", "sub2", "87654321"):
+    for secret in ("hsh=", "hrf", "a123b4567c8de90", "clck", "12527769227"):
         assert secret not in everything, secret
 
 
@@ -698,3 +694,57 @@ def test_html_notification_with_ampersand_escaped_hrefs():
     msg.set_content(html, subtype="html")
     mail_obj = parse_mail(msg.as_bytes())
     assert order_link(mail_obj.links, LINK_RE, ID_RE)[0] == "12345678"
+
+
+def test_secret_looking_and_tracking_parameters_are_dropped_from_the_direct_link_but_routing_ones_stay():
+    link = "https://profi.ru/backoffice/n.php?o=1234567|||x&bo_tkn=abc123&sig=zzz&_prr=1&utm_source=mail&sub1=order&fromSection=Email&auth_code=9"
+    assert order_link([link], LINK_RE, ID_RE) == (
+        "1234567",
+        "https://profi.ru/backoffice/n.php?o=1234567|||x&sub1=order&fromSection=Email",
+    )
+
+
+# ---------------------------------------------------------------- mail buttons
+
+BUTTON_HTML = (
+    "<p>Клиент: нужен ремонт квартиры.</p>"
+    '<a href="https://profi.ru/api/xmail/clck/?id=1">   </a>'
+    '<a href="https://b.profi.ru/abc123DEF456ghij"> Посмотреть <b>заказ</b> </a>'
+    '<a href="https://b.profi.ru/zzzzzzzzzzzzzzzz">Настроить уведомления</a>'
+)
+
+
+def button_mail(n):
+    return mail(
+        n,
+        body=f"Клиент: нужен ремонт квартиры.\nhttps://profi.ru/backoffice/n.php?o={200000 + n}",
+        html=BUTTON_HTML,
+    )
+
+
+def test_button_link_is_picked_by_caption_and_only_on_profi_https():
+    parsed = parse_mail(button_mail(1))
+    assert ("Посмотреть заказ", "https://b.profi.ru/abc123DEF456ghij") in parsed.buttons
+    regex = DEFAULTS["profi_mail"]["button_regex"]
+    assert button_link(parsed.buttons, regex) == "https://b.profi.ru/abc123DEF456ghij"
+    assert button_link([("Посмотреть заказ", "http://b.profi.ru/x")], regex) == ""
+    assert button_link([("Посмотреть заказ", "https://evil.example/x")], regex) == ""
+    assert button_link([("Настроить уведомления", "https://b.profi.ru/x")], regex) == ""
+
+
+def test_direct_link_is_the_default_and_button_mode_is_opt_in():
+    (direct,), _ = run(config(), {1: button_mail(1)})
+    assert "b.profi.ru" not in direct.url and direct.external_id == "200001"
+    (button,), _ = run(config(link_mode="button"), {1: button_mail(1)})
+    assert button.url == "https://b.profi.ru/abc123DEF456ghij" and button.external_id == "200001"
+
+
+def test_button_mode_falls_back_to_direct_link_without_button():
+    (lead,), _ = run(config(link_mode="button"), {1: mail(1)})
+    assert lead.url == "https://profi.ru/order/100001"
+
+
+def test_link_mode_is_validated():
+    cfg = config(link_mode="magic")
+    with pytest.raises(ConfigError, match="link_mode"):
+        validate_config(cfg)
