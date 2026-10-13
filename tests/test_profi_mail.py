@@ -255,6 +255,14 @@ def mail(n, **kw):
 # ---------------------------------------------------------------- collection
 
 
+def test_nothing_visible_reveals_that_the_order_came_from_a_mailbox():
+    leads, _ = run(config(), {1: mail(1)})
+    (lead,) = leads
+    visible = [lead.source, lead.source_group, lead.source_group_id, lead.url, lead.author, lead.price]
+    assert lead.source_group == "Профи.ру" and lead.source_group_id == "profi:orders"
+    assert not any(word in " ".join(visible).lower() for word in ("почт", "mail", "imap", "gmail"))
+
+
 def test_leads_from_notification_mails(tmp_path):
     reports = []
     leads, imap = run(
@@ -262,7 +270,7 @@ def test_leads_from_notification_mails(tmp_path):
     )
     (lead,) = leads
     assert (lead.source, lead.external_id) == ("profi", "100001")
-    assert lead.url == "https://profi.ru/order/100001" and lead.source_group_id == "profi:mail"
+    assert lead.url == "https://profi.ru/order/100001" and lead.source_group_id == "profi:orders"
     assert (
         lead.date.startswith("2026-10-10")
         and "нужен ремонт" in lead.text.lower()
