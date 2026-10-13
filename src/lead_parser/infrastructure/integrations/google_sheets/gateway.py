@@ -46,6 +46,9 @@ class SheetsWriter:
     def __init__(self, cfg: dict, worksheet=None):
         self.ws = worksheet if worksheet is not None else _get_worksheet(cfg)
         rows = self.ws.get_all_values()
+        # A brand-new worksheet comes back from gspread as [[]] (one empty row), not []: that is still "empty".
+        if not any(any(cell.strip() for cell in row) for row in rows):
+            rows = []
         if not rows:
             if self.ws.col_count < len(HEADER):
                 self.ws.add_cols(len(HEADER) - self.ws.col_count)

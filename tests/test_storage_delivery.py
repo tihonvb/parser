@@ -321,3 +321,35 @@ def test_existing_v1_database_reopens_without_rewriting_payload_or_losing_delive
         assert store.reserve_row(resumed, 1000) == 17
         store.delivered(resumed)
         assert store.claim("telegram", ["operator"], now=100)["id"] == 72
+
+
+class FreshWorksheet(Worksheet):
+    """A just-created tab: real gspread returns ``[[]]`` (one empty row), not ``[]``."""
+
+    def __init__(self, empty_value):
+        super().__init__()
+        self.rows = [] if empty_value == "none" else [[] if empty_value == "one_empty_row" else ["", "", ""]]
+        self.col_count = 13
+        self.header_written = None
+
+    def update(self, values=None, range_name=None, **kwargs):
+        if range_name == "A1:M1":
+            self.header_written = values
+            self.rows = [list(values[0])]
+            return None
+        return super().update(values=values, range_name=range_name, **kwargs)
+
+
+@pytest.mark.parametrize("empty_value", ["none", "one_empty_row", "blank_cells"])
+def test_brand_new_empty_worksheet_gets_the_header_instead_of_a_schema_error(empty_value):
+    ws = FreshWorksheet(empty_value)
+    writer = SheetsWriter({}, ws)
+    assert ws.header_written == [HEADER]  # the header is created, not rejected
+    assert writer.minimum_row == 2
+
+
+def test_nonempty_worksheet_with_foreign_header_is_still_rejected():
+    ws = FreshWorksheet("none")
+    ws.rows = [["Другой", "заголовок"]]
+    with pytest.raises(SchemaConflict):
+        SheetsWriter({}, ws)
