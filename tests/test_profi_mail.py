@@ -590,3 +590,49 @@ def test_cli_status_counts_all_mail_when_any_sender_is_allowed(capsys):
     imap = FakeIMAP(mails={1: mail(1), 2: mail(2, sender="x@gmail.com")})
     assert cli.status(passthrough(), imap_factory=lambda *a, **k: imap) == 0
     assert ": 2." in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- real notification shape: id in the query string
+
+TOKENS = "sig=9a123456b78cdef&utm=mail%2D1"
+NOTIFICATION_LINK = f"https://profi.ru/bo/order/view/?id=12345678901&{TOKENS}"
+
+
+def test_order_id_is_taken_from_the_query_and_only_that_parameter_is_kept():
+    mail_obj = parse_mail(
+        build(body=f"Заказ: нужен ремонт\n{NOTIFICATION_LINK}\nВ приложении: {NOTIFICATION_LINK}")
+    )
+    order_id, url = order_link(mail_obj.links, LINK_RE, ID_RE)
+    assert (order_id, url) == ("12345678901", "https://profi.ru/bo/order/view/?id=12345678901")
+    assert "sig=" not in url and "utm" not in url  # sign-in / tracking tokens never leave the mailbox
+
+
+@pytest.mark.parametrize(
+    "link,expected",
+    [
+        (
+            "https://profi.ru/o/view/?utm=111111&id=22222222222",
+            "22222222222",
+        ),  # preferred name wins over order
+        ("https://profi.ru/o/view/?ref=33333333333", "33333333333"),  # any pure-number parameter
+        ("https://profi.ru/o/view/?sig=9a123456b78cdef", ""),  # a token with digits inside is NOT an order id
+        ("https://profi.ru/o/777777/?id=88888888888", "777777"),  # the path wins
+        ("https://profi.ru/o/view/?id=12", ""),  # too short to be an order number
+    ],
+)
+def test_query_id_selection_rules(link, expected):
+    assert order_link([link], LINK_RE, ID_RE)[0] == expected
+
+
+def test_lead_from_a_notification_has_a_clean_link_and_no_tokens_anywhere():
+    body = f"Новый заказ: нужен ремонт квартиры\nПлощадь: 54 м&#178;.\n{NOTIFICATION_LINK}"
+    leads, _ = run(config(), {1: build(body=body, message_id="<n1@profi.ru>")})
+    (lead,) = leads
+    assert lead.external_id == "12345678901" and lead.url == "https://profi.ru/bo/order/view/?id=12345678901"
+    for field_value in (lead.text, lead.url, str(lead.extra)):
+        assert "sig=" not in field_value and "9a123456b78cdef" not in field_value
+    assert "54 м²" in lead.text and "&#178;" not in lead.text  # HTML entities are decoded
+
+
+def test_html_entities_in_plain_text_are_decoded():
+    assert "м² & «x»" in parse_mail(build(body="м&#178; &amp; &laquo;x&raquo;")).text

@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import email
 import hashlib
+import html as htmllib
 import re
 from dataclasses import dataclass, field
 from email import policy
 from email.message import EmailMessage
 from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 _BLOCK_TAGS = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "section"}
 _SKIPPED_TAGS = {"script", "style", "head", "title"}
@@ -93,7 +94,9 @@ def parse_mail(raw: bytes) -> Mail:
     links: list[str] = []
     body = ""
     if plain is not None:
-        body = plain.get_content()
+        body = htmllib.unescape(
+            plain.get_content()
+        )  # the plain part may carry literal HTML entities (&#178;)
         links.extend(_URL.findall(body))
     if html is not None:
         html_text, hrefs = html_to_text(html.get_content())
@@ -119,8 +122,16 @@ def domain_allowed(domain: str, allowed: list[str]) -> bool:
     return any(domain == item.lower() or domain.endswith("." + item.lower()) for item in allowed)
 
 
+_ID_PARAMS = {"id", "order", "order_id", "orderid", "oid"}
+
+
 def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[str, str]:
-    """(order id, canonical https URL) of the first profi.ru link with an order number in its path."""
+    """(order id, canonical https URL) of the first profi.ru link that carries an order number.
+
+    The number is looked for in the path first, then in the query string (preferred parameter names first, and
+    only a value that matches ``id_pattern`` as a whole). The canonical link keeps ONLY that parameter: the other
+    query parameters of notification links are tracking or sign-in tokens and must never be copied to Telegram
+    or the sheet."""
     wanted = re.compile(link_pattern)
     pattern = re.compile(id_pattern)
     for link in links:
@@ -130,9 +141,15 @@ def order_link(links: list[str], link_pattern: str, id_pattern: str) -> tuple[st
         host = parts.hostname or ""
         if parts.scheme != "https" or not (host == "profi.ru" or host.endswith(".profi.ru")):
             continue
+        base = f"https://{host}{parts.path}"
         found = pattern.search(parts.path)
         if found:
-            return found.group(1), f"https://{host}{parts.path}"
+            return found.group(1), base
+        params = sorted(parse_qsl(parts.query), key=lambda item: item[0].lower() not in _ID_PARAMS)
+        for name, value in params:
+            matched = pattern.fullmatch(value)
+            if matched:
+                return matched.group(1), f"{base}?{urlencode({name: value})}"
     return "", ""
 
 
