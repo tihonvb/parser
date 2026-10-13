@@ -7,7 +7,8 @@ Safety and honesty:
 
 * TLS only (IMAP4_SSL); the mailbox is opened ``readonly`` and messages are fetched with ``BODY.PEEK``:
   nothing is marked as read, moved or deleted;
-* only mail from ``profi_mail.sender_domains``; mail whose ``Authentication-Results`` reports a failed
+* only mail from ``profi_mail.sender_domains`` (an empty list accepts any sender — for a mailbox that only
+  receives Profi.ru notifications); mail whose ``Authentication-Results`` reports a failed
   DKIM/SPF/DMARC is rejected (a forged sender cannot inject leads when the provider reports it);
 * progress is a UID cursor (``uidvalidity`` + ``last_uid``) advanced only after the leads of a batch are stored;
   if ``max_messages_per_run`` is reached the report says ``complete=False`` and the next run continues;
@@ -75,9 +76,14 @@ def select_folder(imap, folder: str) -> int:
 def _make_lead(mail: Mail, uid: int, cfg: dict) -> tuple[Lead | None, str]:
     settings = cfg["profi_mail"]
     text = lead_text(mail, settings["body_start_regex"], settings["body_end_regex"])
-    passed, reason = keyword_decision(text, cfg["general"]["keywords"], cfg["general"]["exclude_keywords"])
-    if not passed:
-        return None, reason
+    if settings["keyword_filter"]:
+        passed, reason = keyword_decision(
+            text, cfg["general"]["keywords"], cfg["general"]["exclude_keywords"]
+        )
+        if not passed:
+            return None, reason
+    else:
+        reason = "unfiltered"  # every accepted mail becomes a lead; relevance is left to the later stages
     order_id, url = order_link(mail.links, settings["link_pattern"], settings["order_id_pattern"])
     if not order_id:
         order_id, reason = fallback_id(mail), "no_order_link"
@@ -121,6 +127,11 @@ def _scan(imap, cfg: dict, store: CollectionState | None, result: ScanResult, no
     subject_filter = (
         re.compile(settings["subject_regex"], re.IGNORECASE) if settings["subject_regex"] else None
     )
+    subject_excluded = (
+        re.compile(settings["exclude_subject_regex"], re.IGNORECASE)
+        if settings["exclude_subject_regex"]
+        else None
+    )
     budget = settings["max_messages_per_run"]
     if len(uids) > budget:
         result.fail(f"BudgetExhausted:{len(uids) - budget} messages remain for the next run")
@@ -145,6 +156,8 @@ def _scan(imap, cfg: dict, store: CollectionState | None, result: ScanResult, no
                     result.counted("failed_authentication")
                 elif subject_filter and not subject_filter.search(mail.subject):
                     result.counted("subject_filtered")
+                elif subject_excluded and subject_excluded.search(mail.subject):
+                    result.counted("subject_excluded")
                 else:
                     lead, reason = _make_lead(mail, uid, cfg)
                     result.counted(reason)

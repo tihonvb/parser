@@ -437,7 +437,6 @@ def test_enabled_requires_credentials_but_checks_run_only_with_access():
 @pytest.mark.parametrize(
     "override",
     [
-        {"sender_domains": []},
         {"sender_domains": ["not a domain"]},
         {"sender_domains": "profi.ru"},
         {"link_pattern": "("},
@@ -518,3 +517,76 @@ def test_cli_inspect_writes_masked_structure_and_private_raw_copy(tmp_path, caps
 def test_cli_inspect_without_matching_mail(tmp_path, capsys):
     code = cli.inspect(config(), 1, tmp_path / "s.txt", None, imap_factory=lambda *a, **k: FakeIMAP(mails={}))
     assert code == 2 and "nothing to inspect" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- "everything goes through" mode
+
+
+def passthrough(**override):
+    values = {"sender_domains": [], "keyword_filter": False}
+    values.update(override)
+    return config(**values)
+
+
+def test_empty_sender_list_accepts_any_sender_but_still_rejects_failed_authentication():
+    assert domain_allowed("anything.example", [])
+    mails = {
+        1: mail(1, sender="Кто-то <someone@gmail.com>", body="Просто письмо без ключевых слов"),
+        2: mail(2, sender="forged@evil.com", auth="mx; dkim=fail", body="Просто письмо"),
+    }
+    reports = []
+    leads, _ = run(passthrough(), mails, reports=reports)
+    assert [lead.extra["message_uid"] for lead in leads] == [1]
+    assert reports[0].prefilter["failed_authentication"] == 1
+
+
+def test_keyword_filter_off_turns_every_accepted_mail_into_a_lead():
+    mails = {1: mail(1, subject="Новый заказ", body="Текст без слов про ремонт https://profi.ru/order/55555")}
+    assert run(config(), mails)[0] == []  # default: the keyword pre-filter drops it
+    reports = []
+    leads, _ = run(passthrough(), mails, reports=reports)
+    assert [lead.external_id for lead in leads] == ["55555"]
+    assert reports[0].prefilter == {"unfiltered": 1}
+
+
+def test_unfiltered_mail_without_link_still_gets_a_stable_id():
+    leads, _ = run(passthrough(), {1: mail(1, body="Без ссылки")})
+    assert leads[0].external_id.startswith("mail-") and leads[0].url == ""
+
+
+def test_subject_exclusion_removes_confirmations_and_newsletters():
+    mails = {
+        1: mail(1, subject="Подтвердите адрес электронной почты"),
+        2: mail(2, subject="Новый заказ: ремонт"),
+        3: mail(3, subject="Рассылка: скидки"),
+    }
+    reports = []
+    leads, _ = run(passthrough(exclude_subject_regex="подтверд|рассылк"), mails, reports=reports)
+    assert [lead.extra["message_uid"] for lead in leads] == [2]
+    assert reports[0].prefilter["subject_excluded"] == 2
+
+
+def test_default_behaviour_is_unchanged():
+    assert DEFAULTS["profi_mail"]["keyword_filter"] is True
+    assert DEFAULTS["profi_mail"]["sender_domains"] == ["profi.ru"]
+    assert DEFAULTS["profi_mail"]["exclude_subject_regex"] == ""
+
+
+def test_passthrough_settings_validate_but_bad_values_do_not():
+    validate_config(
+        base(sender_domains=[], keyword_filter=False, exclude_subject_regex="подтверд"), require_access=False
+    )
+    for bad in (
+        {"keyword_filter": "no"},
+        {"exclude_subject_regex": "("},
+        {"sender_domains": ["not a domain"]},
+        {"sender_domains": "x"},
+    ):
+        with pytest.raises(ConfigError):
+            validate_config(base(**bad), require_access=False)
+
+
+def test_cli_status_counts_all_mail_when_any_sender_is_allowed(capsys):
+    imap = FakeIMAP(mails={1: mail(1), 2: mail(2, sender="x@gmail.com")})
+    assert cli.status(passthrough(), imap_factory=lambda *a, **k: imap) == 0
+    assert ": 2." in capsys.readouterr().out

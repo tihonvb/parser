@@ -112,6 +112,9 @@ def parse_mail(raw: bytes) -> Mail:
 
 
 def domain_allowed(domain: str, allowed: list[str]) -> bool:
+    """Is the sender's domain accepted? An EMPTY list means any sender (a mailbox that only receives Profi.ru)."""
+    if not allowed:
+        return True
     domain = domain.lower().rstrip(".")
     return any(domain == item.lower() or domain.endswith("." + item.lower()) for item in allowed)
 
