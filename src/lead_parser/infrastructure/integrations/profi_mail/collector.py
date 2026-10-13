@@ -32,6 +32,7 @@ from lead_parser.core.policies import extract_phone, keyword_decision
 from lead_parser.infrastructure.integrations.profi_mail import oauth
 from lead_parser.infrastructure.integrations.profi_mail.message import (
     Mail,
+    button_link,
     domain_allowed,
     fallback_id,
     lead_text,
@@ -88,6 +89,9 @@ def _make_lead(mail: Mail, uid: int, cfg: dict) -> tuple[Lead | None, str]:
     else:
         reason = "unfiltered"  # every accepted mail becomes a lead; relevance is left to the later stages
     order_id, url = order_link(mail.links, settings["link_pattern"], settings["order_id_pattern"])
+    if settings["link_mode"] == "button":
+        # explicit opt-in: the mail button signs the user in, see message.button_link
+        url = button_link(mail.buttons, settings["button_regex"]) or url
     if not order_id:
         order_id, reason = fallback_id(mail), "no_order_link"
     return (

@@ -69,6 +69,8 @@ profi_mail:
   subject_regex: ''
   exclude_subject_regex: ''
   keyword_filter: true
+  link_mode: direct         # direct | button; button = ссылка с кнопки письма «Посмотреть заказ» (ВХОДИТ в кабинет без пароля!)
+  button_regex: "посмотреть заказ|открыть заказ|смотреть заказ"
   lookback_days: 3
   max_messages_per_run: 200
   request_timeout_seconds: 30
