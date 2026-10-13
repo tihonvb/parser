@@ -67,6 +67,8 @@ profi_mail:
   folder: INBOX
   sender_domains: [profi.ru]
   subject_regex: ''
+  exclude_subject_regex: ''
+  keyword_filter: true
   lookback_days: 3
   max_messages_per_run: 200
   request_timeout_seconds: 30

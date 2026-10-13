@@ -93,6 +93,8 @@ DEFAULTS = {
         "folder": "INBOX",
         "sender_domains": ["profi.ru"],
         "subject_regex": "",
+        "exclude_subject_regex": "",
+        "keyword_filter": True,
         "lookback_days": 3,
         "max_messages_per_run": 200,
         "request_timeout_seconds": 30,
@@ -371,15 +373,15 @@ def _compile(label: str, pattern: str, *, groups: int | None = None) -> None:
 def _validate_profi_mail_static(mail: dict) -> None:
     """Shape checks that never need the connector to be enabled."""
     domains = mail["sender_domains"]
-    if (
-        not isinstance(domains, list)
-        or not domains
-        or any(
-            not isinstance(d, str) or not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", d.lower()) for d in domains
-        )
+    if not isinstance(domains, list) or any(
+        not isinstance(d, str) or not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", d.lower()) for d in domains
     ):
-        raise ConfigError("profi_mail.sender_domains: expected a non-empty list of domains like profi.ru")
-    for key in ("subject_regex", "body_start_regex", "body_end_regex"):
+        raise ConfigError(
+            "profi_mail.sender_domains: expected a list of domains like profi.ru (empty = any sender)"
+        )
+    if type(mail["keyword_filter"]) is not bool:
+        raise ConfigError("profi_mail.keyword_filter: expected boolean")
+    for key in ("subject_regex", "exclude_subject_regex", "body_start_regex", "body_end_regex"):
         if not isinstance(mail[key], str):
             raise ConfigError(f"profi_mail.{key}: expected string")
         _compile(key, mail[key])
