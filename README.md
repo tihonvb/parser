@@ -36,7 +36,7 @@ uv run --locked lead-parser --config config.yaml --check-config
 - **Профи.ру через почту:** заказы из e-mail-уведомлений специалиста по IMAP, только чтение (`profi_mail`, пароль приложения в `PROFI_MAIL_PASSWORD`). Без входа на сайт и без браузера. Подробности и безопасность: [docs/profi-mail.md](docs/profi-mail.md).
 - **ИИ:** `ai_filter.enabled: true`, `OPENROUTER_API_KEY`, `model`, `min_confidence`. Включённый фильтр без ключа блокирует запуск. Отключение фильтра явно принимает кандидатов без оценки ИИ — для клиентского запуска выбор режима надо зафиксировать.
 - **Sheets:** `output.enabled: true`, JSON сервисного аккаунта в `GOOGLE_SERVICE_ACCOUNT_FILE`, `GOOGLE_SPREADSHEET_ID`, `worksheet_name`. Предоставьте адресу сервисного аккаунта доступ редактора. Старый 9-колоночный лист сначала мигрируйте.
-- **Telegram Bot API:** `notifications.telegram.enabled: true`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` и/или YAML `chat_ids`. Уведомления требуют включённой доставки Sheets. Список получателей фиксируется при первом создании задания: добавление нового получателя не рассылает старую историю.
+- **Telegram Bot API:** `notifications.telegram.enabled: true`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_CHAT_IDS` (через запятую) и/или YAML `chat_ids`. Уведомления требуют включённой доставки Sheets. Список получателей фиксируется при первом создании задания: добавление нового получателя не рассылает старую историю.
 
 Управление VK ID:
 

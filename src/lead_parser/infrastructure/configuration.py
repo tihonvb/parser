@@ -443,6 +443,13 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
             for key in keys[:-1]:
                 target = target[key]
             target[keys[-1]] = environment[name]
+    # several recipients: TELEGRAM_CHAT_IDS="111,222 333" is added to YAML chat_ids / TELEGRAM_CHAT_ID
+    extra_ids = [
+        item for item in re.split(r"[,\s;]+", str(environment.get("TELEGRAM_CHAT_IDS") or "")) if item
+    ]
+    if extra_ids:
+        tg = cfg["notifications"]["telegram"]
+        tg["chat_ids"] = [*tg["chat_ids"], *extra_ids]
     for section, keys in {
         "storage": ["database", "seen_store", "lock_file"],
         "telegram": ["session_name"],

@@ -748,3 +748,17 @@ def test_link_mode_is_validated():
     cfg = config(link_mode="magic")
     with pytest.raises(ConfigError, match="link_mode"):
         validate_config(cfg)
+
+
+def test_several_telegram_recipients_from_environment(tmp_path, monkeypatch):
+    from lead_parser.infrastructure.configuration import load_config
+
+    (tmp_path / "config.yaml").write_text(
+        "notifications:\n  telegram:\n    chat_ids: [5]\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
+    monkeypatch.setenv("TELEGRAM_CHAT_IDS", "2, 3;4")
+    tg = load_config(tmp_path / "config.yaml")["notifications"]["telegram"]
+    from lead_parser.infrastructure.integrations.telegram.notifications import _collect_chat_ids
+
+    assert _collect_chat_ids(tg) == ["1", "5", "2", "3", "4"]
