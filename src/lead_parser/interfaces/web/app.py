@@ -12,8 +12,9 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 
 from lead_parser.infrastructure.persistence.sqlite import Store
+from lead_parser.infrastructure.tracking import looks_like_bot
 
-STATUSES = {"": "Все", "free": "Свободные", "taken": "Взятые"}
+STATUSES = {"": "Все", "unopened": "Не открыты", "free": "Свободные", "taken": "Взятые"}
 STYLE = """
 :root{color-scheme:light dark;--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--line:#e3e3e8;--ok:#1a7f37;--chip:#f2f2f5}
 @media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#f2f2f5;--mut:#9a9aa1;--line:#2c2c30;--ok:#4cc96b;--chip:#232326}}
@@ -23,7 +24,7 @@ nav a{display:inline-block;margin:0 6px 12px 0;padding:6px 12px;border-radius:99
 nav a.on{background:var(--fg);color:var(--bg)}
 article{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:0 0 10px}
 .meta{color:var(--mut);font-size:13px}.text{margin:6px 0;white-space:pre-wrap;word-break:break-word}
-.who{font-size:13px;margin-top:6px}.taken{color:var(--ok);font-weight:600}.skip{color:var(--mut)}
+.who{font-size:13px;margin-top:6px}.seen{color:var(--ok)}.unseen{color:#c0392b}.taken{color:var(--ok);font-weight:600}.skip{color:var(--mut)}
 """
 
 
@@ -31,7 +32,8 @@ def _when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%d.%m %H:%M")
 
 
-def render(rows: list[dict], status: str, title: str) -> str:
+def render(rows: list[dict], status: str, title: str, names: dict | None = None) -> str:
+    names = names or {}
     cards = []
     for row in rows:
         lead = row["lead"]
@@ -50,6 +52,17 @@ def render(rows: list[dict], status: str, title: str) -> str:
                 )
             else:
                 marks.append(f'<span class="skip">🚫 {who} не берёт</span>')
+        for r in row["recipients"]:
+            person = html.escape(str(names.get(r["chat_id"]) or r["chat_id"]))
+            click = r["click"]
+            if click:
+                marks.insert(
+                    0,
+                    f'<span class="seen">👁 {person}: перешёл</span> <span class="meta">{_when(click["first_at"])}'
+                    f"{', раз: ' + str(click['count']) if click['count'] > 1 else ''}</span>",
+                )
+            else:
+                marks.insert(0, f'<span class="unseen">○ {person}: не переходил</span>')
         who_line = "<br>".join(marks) or '<span class="meta">Пока никто не взял</span>'
         cards.append(
             f'<article><div class="meta">{_when(row["first_seen"])} · {html.escape(lead.source_group or lead.source)}'
@@ -69,7 +82,7 @@ def render(rows: list[dict], status: str, title: str) -> str:
     )
 
 
-def make_handler(db_path: str, token: str, title: str):
+def make_handler(db_path: str, token: str, title: str, names: dict | None = None):
     if len(token) < 16:
         raise ValueError("web token must be at least 16 characters")
 
@@ -87,6 +100,8 @@ def make_handler(db_path: str, token: str, title: str):
         def do_GET(self) -> None:
             parts = urlsplit(self.path)
             query = parse_qs(parts.query)
+            if parts.path.startswith("/r/"):
+                return self._redirect(parts.path[3:])
             if parts.path != "/":
                 return self._send(HTTPStatus.NOT_FOUND, "not found")
             if not self._authorized(query):
@@ -95,11 +110,29 @@ def make_handler(db_path: str, token: str, title: str):
             status = (query.get("status") or [""])[0]
             status = status if status in STATUSES else ""
             with Store(db_path) as store:
-                page = render(store.board(status=status), status, title)
+                page = render(store.board(status=status), status, title, names)
             headers = {}
             if (query.get("key") or [""])[0]:
                 headers["Set-Cookie"] = f"key={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000"
             self._send(HTTPStatus.OK, page, headers)
+
+        def _redirect(self, link: str) -> None:
+            """Personal tracking link: count the click (not link-preview bots) and go to the order."""
+            if len(link) != 20 or not link.isalnum():
+                return self._send(HTTPStatus.NOT_FOUND, "not found")
+            with Store(db_path) as store:
+                found = store.find_link(link, token)
+                if found is None or not found[0].url.startswith("https://"):
+                    return self._send(HTTPStatus.NOT_FOUND, "not found")
+                lead, chat_id = found
+                if not looks_like_bot(self.headers.get("User-Agent", "")):
+                    store.record_click(lead.dedupe_key(), chat_id)
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", lead.url)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _send(self, code, body: str, headers: dict | None = None) -> None:
             data = body.encode()

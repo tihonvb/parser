@@ -198,3 +198,104 @@ def test_config_validation():
     conf["web"]["port"] = 0
     with pytest.raises(ConfigError, match="web"):
         validate_config(conf, require_access=False)
+
+
+# ---------------------------------------------------------------- click tracking
+
+from urllib.request import HTTPRedirectHandler, build_opener  # noqa: E402
+
+from lead_parser.infrastructure.tracking import click_token, tracked_url  # noqa: E402
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fetch(url, agent="Mozilla/5.0 (iPhone)"):
+    try:
+        build_opener(NoRedirect).open(Request(url, headers={"User-Agent": agent}), timeout=5)
+    except HTTPError as error:
+        return error
+    raise AssertionError("expected a redirect or an error")
+
+
+def track_cfg():
+    conf = cfg()
+    conf["notifications"]["telegram"].update(track_clicks=True)
+    conf["web"].update(public_url="http://129.101.125.85:8080/", token=TOKEN)
+    return conf
+
+
+def test_message_contains_a_personal_tracking_link(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        notifications.requests,
+        "post",
+        lambda url, json, timeout: (
+            sent.append(json) or type("R", (), {"status_code": 200, "json": lambda s: {"ok": True}})()
+        ),
+    )
+    order = lead(7, url="https://b.profi.ru/abcdefghijklmnop")
+    notifications.send_to(track_cfg(), order, "10")
+    notifications.send_to(track_cfg(), order, "20")
+    first, second = (m["text"].split("Ссылка: ")[1].split("\n")[0] for m in sent)
+    assert first == tracked_url("http://129.101.125.85:8080", TOKEN, "profi:7", "10")
+    assert first != second and "profi.ru" not in first + second  # personal, and the real address stays hidden
+    notifications.send_to(cfg(), order, "10")
+    assert "Ссылка: https://b.profi.ru/abcdefghijklmnop" in sent[-1]["text"]  # off by default
+
+
+def test_click_is_recorded_per_recipient_and_redirects(store, server):
+    for chat in ("10", "20"):
+        store.db.execute(
+            "INSERT OR IGNORE INTO deliveries(lead_key,kind,destination,state,created) VALUES (?,?,?,?,0)",
+            ("profi:2", "telegram", chat, "done"),
+        )
+    link = f"{server}/r/{click_token(TOKEN, 'profi:2', '10')}"
+    answer = fetch(link)
+    assert answer.code == 302 and answer.headers["Location"] == "https://b.profi.ru/abcdefghijklmnop"
+    fetch(link)
+    (row,) = [r for r in store.board() if r["key"] == "profi:2"]
+    clicked = {r["chat_id"]: r["click"] for r in row["recipients"]}
+    assert clicked["10"]["count"] == 2 and clicked["20"] is None
+    assert {r["key"] for r in store.board(status="unopened")} == {
+        "profi:1",
+        "profi:2",
+    }  # 20 never opened profi:2
+    body = get(f"{server}/?key={TOKEN}").read().decode()
+    assert "10: перешёл" in body and "20: не переходил" in body
+
+
+def test_preview_bots_and_bad_tokens_are_not_counted(store, server):
+    store.db.execute(
+        "INSERT OR IGNORE INTO deliveries(lead_key,kind,destination,state,created) VALUES (?,?,?,?,0)",
+        ("profi:2", "telegram", "10", "done"),
+    )
+    link = f"{server}/r/{click_token(TOKEN, 'profi:2', '10')}"
+    assert fetch(link, agent="TelegramBot (like TwitterBot)").code == 302
+    assert fetch(link, agent="").code == 302
+    assert store.db.execute("SELECT count(*) FROM clicks").fetchone()[0] == 0
+    assert fetch(f"{server}/r/{'a' * 20}").code == 404
+    assert fetch(f"{server}/r/../etc").code == 404
+    assert fetch(f"{server}/r/{click_token('another-secret-xxxxxxxx', 'profi:2', '10')}").code == 404
+
+
+def test_track_clicks_validation(monkeypatch, tmp_path):
+    from lead_parser.infrastructure.configuration import load_config
+
+    conf = cfg()
+    conf["output"]["enabled"] = True
+    conf["notifications"]["telegram"]["track_clicks"] = True
+    with pytest.raises(ConfigError, match="public_url"):
+        validate_config(conf, require_access=False)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "notifications:\n  telegram:\n    track_clicks: true\nweb:\n  public_url: http://h:1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LEAD_WEB_TOKEN", raising=False)
+    with pytest.raises(ConfigError, match="web.token"):
+        load_config(path, require_access=False)
+    monkeypatch.setenv("LEAD_WEB_TOKEN", TOKEN)
+    assert load_config(path, require_access=False)["web"]["token"] == TOKEN

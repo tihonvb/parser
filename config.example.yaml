@@ -128,3 +128,4 @@ web:
   port: 8080
   token: ""           # или переменная LEAD_WEB_TOKEN, не короче 16 символов
   title: Заявки
+  public_url: ""    # для трекера переходов (track_clicks), например http://IP:8080

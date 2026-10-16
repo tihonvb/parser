@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -19,6 +20,7 @@ from lead_parser.application.errors import StorageError
 from lead_parser.application.models import ClassifiedLead, DeliveryPlan, LeadStatisticsRecord, ScanResult
 from lead_parser.core.models import Lead
 from lead_parser.core.policies import unique_leads
+from lead_parser.infrastructure.tracking import click_token
 
 SCHEMA_VERSION = 1
 
@@ -52,6 +54,10 @@ class Store:
               ai_next_at REAL NOT NULL DEFAULT 0, verdict TEXT, ai_error TEXT,
               first_seen REAL NOT NULL, last_seen REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS legacy_seen (key TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS clicks (
+              lead_key TEXT NOT NULL REFERENCES leads(key), chat_id TEXT NOT NULL,
+              first_at REAL NOT NULL, last_at REAL NOT NULL, count INTEGER NOT NULL,
+              PRIMARY KEY(lead_key, chat_id));
             CREATE TABLE IF NOT EXISTS claims (
               lead_key TEXT NOT NULL REFERENCES leads(key), user_id TEXT NOT NULL,
               user_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, updated REAL NOT NULL,
@@ -473,6 +479,24 @@ class Store:
         ).fetchone()
         return row["status"] if row else None
 
+    def find_link(self, token: str, secret: str) -> tuple[Lead, str] | None:
+        """The lead and recipient behind a tracking token (tokens are HMACs, so they are recomputed)."""
+        for row in self.db.execute(
+            "SELECT d.lead_key, d.destination, l.payload FROM deliveries d JOIN leads l ON l.key=d.lead_key "
+            "WHERE d.kind='telegram'"
+        ):
+            if hmac.compare_digest(click_token(secret, row["lead_key"], row["destination"]), token):
+                return _decode_lead(json.loads(row["payload"])), row["destination"]
+        return None
+
+    def record_click(self, key: str, chat_id: str, *, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self.db.execute(
+            "INSERT INTO clicks VALUES (?,?,?,?,1) ON CONFLICT(lead_key,chat_id) DO UPDATE SET "
+            "last_at=excluded.last_at,count=count+1",
+            (key, chat_id, now, now),
+        )
+
     def board(self, *, status: str = "", limit: int = 200) -> list[dict]:
         """Leads that were sent to Telegram, newest first, with everyone's marks."""
         rows = self.db.execute(
@@ -485,16 +509,36 @@ class Store:
             "SELECT lead_key,user_id,user_name,status,updated FROM claims ORDER BY updated"
         ):
             marks.setdefault(claim["lead_key"], []).append(dict(claim))
+        sent: dict[str, list[str]] = {}
+        for d in self.db.execute(
+            "SELECT lead_key,destination FROM deliveries WHERE kind='telegram' AND state='done' ORDER BY id"
+        ):
+            sent.setdefault(d["lead_key"], []).append(d["destination"])
+        clicks: dict[tuple[str, str], dict] = {
+            (c["lead_key"], c["chat_id"]): dict(c) for c in self.db.execute("SELECT * FROM clicks")
+        }
         result = []
         for row in rows:
             lead = _decode_lead(json.loads(row["payload"]))
             current = marks.get(row["key"], [])
+            recipients = [
+                {"chat_id": chat, "click": clicks.get((row["key"], chat))}
+                for chat in sent.get(row["key"], [])
+            ]
+            if status == "unopened" and all(r["click"] for r in recipients):
+                continue
             if status == "taken" and not any(m["status"] == "taken" for m in current):
                 continue
             if status == "free" and any(m["status"] == "taken" for m in current):
                 continue
             result.append(
-                {"key": row["key"], "lead": lead, "first_seen": row["first_seen"], "claims": current}
+                {
+                    "key": row["key"],
+                    "lead": lead,
+                    "first_seen": row["first_seen"],
+                    "claims": current,
+                    "recipients": recipients,
+                }
             )
             if len(result) >= limit:
                 break

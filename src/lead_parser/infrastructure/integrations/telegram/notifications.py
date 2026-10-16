@@ -9,6 +9,7 @@ from lead_parser.application.models import DeliveryJob
 from lead_parser.core.models import Lead
 from lead_parser.infrastructure.persistence.sqlite import claim_token
 from lead_parser.infrastructure.security import delivery_error
+from lead_parser.infrastructure.tracking import tracked_url
 
 
 class NotificationError(DeliveryError):
@@ -20,14 +21,14 @@ class NotificationError(DeliveryError):
         )
 
 
-def _format_message(lead: Lead) -> str:
+def _format_message(lead: Lead, url: str = "") -> str:
     return "\n".join(
         [
             f"Новый лид ({lead.source})",
             lead.source_group,
             lead.text[:2400],
             f"Телефон: {lead.phone or '—'}",
-            f"Ссылка: {lead.url or '—'}",
+            f"Ссылка: {url or lead.url or '—'}",
             f"ИИ: {lead.extra.get('ai_confidence', 'отключён')} {lead.extra.get('ai_reason', '')[:400]}",
         ]
     )[:4096]
@@ -52,7 +53,12 @@ def keyboard(token: str, status: str | None = None) -> dict:
 
 def send_to(cfg: dict, lead: Lead, chat_id: str) -> None:
     settings = cfg["notifications"]["telegram"]
-    body = {"chat_id": chat_id, "text": _format_message(lead), "disable_web_page_preview": True}
+    url = ""
+    if settings.get("track_clicks") and lead.url.startswith("https://"):
+        # the recipient gets a personal link of ours that records the click and redirects to the order
+        web = cfg["web"]
+        url = tracked_url(web["public_url"], web["token"], lead.dedupe_key(), str(chat_id))
+    body = {"chat_id": chat_id, "text": _format_message(lead, url), "disable_web_page_preview": True}
     if settings.get("claim_buttons"):
         body["reply_markup"] = keyboard(claim_token(lead.dedupe_key()))
     response = requests.post(

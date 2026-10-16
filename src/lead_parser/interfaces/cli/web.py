@@ -32,7 +32,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     cfg = load_config(args.config, require_access=False)
     web = cfg["web"]
-    handler = make_handler(cfg["storage"]["database"], web["token"], web["title"])
+    handler = make_handler(
+        cfg["storage"]["database"], web["token"], web["title"], cfg["notifications"]["telegram"]["names"]
+    )
     stop = threading.Event()
     tg = cfg["notifications"]["telegram"]
     if tg["enabled"] and tg["claim_buttons"]:

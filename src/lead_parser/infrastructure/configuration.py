@@ -133,9 +133,11 @@ DEFAULTS = {
             "chat_ids": [],
             "timeout_seconds": 10,
             "claim_buttons": False,
+            "track_clicks": False,
+            "names": {},
         }
     },
-    "web": {"host": "127.0.0.1", "port": 8080, "token": "", "title": "Заявки"},
+    "web": {"host": "127.0.0.1", "port": 8080, "token": "", "title": "Заявки", "public_url": ""},
     "schedule": {"interval_minutes": 60},
     "storage": {
         "database": ".data/parser.sqlite3",
@@ -335,6 +337,8 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("Notifications require Sheets delivery to be enabled")
     if type(tg.get("claim_buttons")) is not bool:
         raise ConfigError("notifications.telegram.claim_buttons: expected true or false")
+    if type(tg.get("track_clicks")) is not bool or not isinstance(tg.get("names"), dict):
+        raise ConfigError("notifications.telegram: track_clicks must be true/false, names a mapping")
     web = cfg["web"]
     if (
         not isinstance(web, dict)
@@ -343,6 +347,8 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         or not 1 <= web["port"] <= 65535
     ):
         raise ConfigError("web: expected host (text) and port (1-65535)")
+    if tg["track_clicks"] and not str(web.get("public_url", "")).startswith(("http://", "https://")):
+        raise ConfigError("track_clicks needs web.public_url (http/https address)")
     _validate_profi_mail_static(cfg["profi_mail"])
     if not require_access:
         return
@@ -462,6 +468,11 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
             for key in keys[:-1]:
                 target = target[key]
             target[keys[-1]] = environment[name]
+    web_token = cfg["web"]["token"]
+    if cfg["notifications"]["telegram"]["track_clicks"] and (
+        not isinstance(web_token, str) or len(web_token) < 16
+    ):
+        raise ConfigError("track_clicks needs web.token (or LEAD_WEB_TOKEN) of 16+ characters")
     # several recipients: TELEGRAM_CHAT_IDS="111,222 333" is added to YAML chat_ids / TELEGRAM_CHAT_ID
     extra_ids = [
         item for item in re.split(r"[,\s;]+", str(environment.get("TELEGRAM_CHAT_IDS") or "")) if item
