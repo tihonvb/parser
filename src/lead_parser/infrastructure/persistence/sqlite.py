@@ -489,13 +489,19 @@ class Store:
                 return _decode_lead(json.loads(row["payload"])), row["destination"]
         return None
 
-    def record_click(self, key: str, chat_id: str, *, now: float | None = None) -> None:
+    def record_click(self, key: str, chat_id: str, *, now: float | None = None) -> bool:
+        """Count a click; True when it is the recipient's first one for this lead."""
         now = time.time() if now is None else now
+        first = (
+            self.db.execute("SELECT 1 FROM clicks WHERE lead_key=? AND chat_id=?", (key, chat_id)).fetchone()
+            is None
+        )
         self.db.execute(
             "INSERT INTO clicks VALUES (?,?,?,?,1) ON CONFLICT(lead_key,chat_id) DO UPDATE SET "
             "last_at=excluded.last_at,count=count+1",
             (key, chat_id, now, now),
         )
+        return first
 
     def board(self, *, status: str = "", limit: int = 200) -> list[dict]:
         """Leads that were sent to Telegram, newest first, with everyone's marks."""

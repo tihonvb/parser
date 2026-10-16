@@ -299,3 +299,46 @@ def test_track_clicks_validation(monkeypatch, tmp_path):
         load_config(path, require_access=False)
     monkeypatch.setenv("LEAD_WEB_TOKEN", TOKEN)
     assert load_config(path, require_access=False)["web"]["token"] == TOKEN
+
+
+def test_panel_can_be_switched_off_and_first_click_is_announced(store, monkeypatch):
+    store.db.execute(
+        "INSERT OR IGNORE INTO deliveries(lead_key,kind,destination,state,created) VALUES (?,?,?,?,0)",
+        ("profi:2", "telegram", "10", "done"),
+    )
+    announced = []
+
+    def loopback_only(sock, address):
+        assert address[0] == "127.0.0.1"
+        return REAL_CONNECT(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", loopback_only)
+    handler = make_handler(
+        str(store.path), TOKEN, "t", panel=False, on_first_click=lambda lead, chat: announced.append(chat)
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        assert fetch(f"{base}/?key={TOKEN}").code == 404  # no panel at all
+        link = f"{base}/r/{click_token(TOKEN, 'profi:2', '10')}"
+        assert fetch(link).code == 302
+        assert fetch(link).code == 302
+        assert fetch(link, agent="TelegramBot").code == 302
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert announced == ["10"]  # once: the repeat and the preview bot are silent
+    assert store.db.execute("SELECT count FROM clicks").fetchone()[0] == 2
+
+
+def test_click_notifier_is_built_only_when_enabled():
+    from lead_parser.interfaces.cli.web import click_notifier
+
+    conf = cfg()
+    conf["notifications"]["telegram"].update(chat_id="1", click_notify=False)
+    assert click_notifier(conf) is None
+    conf["notifications"]["telegram"]["click_notify"] = True
+    assert callable(click_notifier(conf))
+    conf["notifications"]["telegram"]["chat_id"] = ""
+    assert click_notifier(conf) is None

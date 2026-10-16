@@ -6,6 +6,8 @@ import threading
 import time
 from http.server import ThreadingHTTPServer
 
+import requests
+
 from lead_parser.infrastructure.configuration import CONFIG_PATH, load_config
 from lead_parser.infrastructure.integrations.telegram.claims import poll_once
 from lead_parser.infrastructure.persistence.sqlite import Store
@@ -26,6 +28,29 @@ def listen(cfg: dict, stop: threading.Event) -> None:
         time.sleep(0.2)
 
 
+def click_notifier(cfg: dict):
+    """Tell the admin chat that a recipient opened an order (first click only)."""
+    tg = cfg["notifications"]["telegram"]
+    admin = str(tg["chat_id"]).strip()
+    if not (tg["click_notify"] and admin):
+        return None
+
+    def notify(lead, chat_id: str) -> None:
+        who = tg["names"].get(chat_id) or chat_id
+        title = " ".join(lead.text.split())[:90]
+        requests.post(
+            f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+            json={
+                "chat_id": admin,
+                "text": f"👁 {who} открыл(а) заказ\n{title}",
+                "disable_web_page_preview": True,
+            },
+            timeout=(5, 10),
+        )
+
+    return notify
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(CONFIG_PATH))
@@ -33,7 +58,12 @@ def main(argv=None):
     cfg = load_config(args.config, require_access=False)
     web = cfg["web"]
     handler = make_handler(
-        cfg["storage"]["database"], web["token"], web["title"], cfg["notifications"]["telegram"]["names"]
+        cfg["storage"]["database"],
+        web["token"],
+        web["title"],
+        cfg["notifications"]["telegram"]["names"],
+        panel=web["panel"],
+        on_first_click=click_notifier(cfg),
     )
     stop = threading.Event()
     tg = cfg["notifications"]["telegram"]

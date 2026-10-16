@@ -82,7 +82,15 @@ def render(rows: list[dict], status: str, title: str, names: dict | None = None)
     )
 
 
-def make_handler(db_path: str, token: str, title: str, names: dict | None = None):
+def make_handler(
+    db_path: str,
+    token: str,
+    title: str,
+    names: dict | None = None,
+    *,
+    panel: bool = True,
+    on_first_click=None,
+):
     if len(token) < 16:
         raise ValueError("web token must be at least 16 characters")
 
@@ -102,7 +110,7 @@ def make_handler(db_path: str, token: str, title: str, names: dict | None = None
             query = parse_qs(parts.query)
             if parts.path.startswith("/r/"):
                 return self._redirect(parts.path[3:])
-            if parts.path != "/":
+            if parts.path != "/" or not panel:
                 return self._send(HTTPStatus.NOT_FOUND, "not found")
             if not self._authorized(query):
                 time.sleep(1)  # slows token guessing
@@ -125,14 +133,20 @@ def make_handler(db_path: str, token: str, title: str, names: dict | None = None
                 if found is None or not found[0].url.startswith("https://"):
                     return self._send(HTTPStatus.NOT_FOUND, "not found")
                 lead, chat_id = found
+                first_click = False
                 if not looks_like_bot(self.headers.get("User-Agent", "")):
-                    store.record_click(lead.dedupe_key(), chat_id)
+                    first_click = store.record_click(lead.dedupe_key(), chat_id)
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", lead.url)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Length", "0")
             self.end_headers()
+            if first_click and on_first_click:
+                try:
+                    on_first_click(lead, chat_id)  # after the redirect: the visitor never waits for it
+                except Exception:
+                    pass
 
         def _send(self, code, body: str, headers: dict | None = None) -> None:
             data = body.encode()
