@@ -332,13 +332,32 @@ def test_panel_can_be_switched_off_and_first_click_is_announced(store, monkeypat
     assert store.db.execute("SELECT count FROM clicks").fetchone()[0] == 2
 
 
-def test_click_notifier_is_built_only_when_enabled():
-    from lead_parser.interfaces.cli.web import click_notifier
+def test_click_notice_goes_to_each_admin_private_chat(monkeypatch):
+    from lead_parser.interfaces.cli import web as web_cli
 
+    sent = []
+
+    def post(url, json, timeout):
+        sent.append(json["chat_id"])
+        if json["chat_id"] == "2":
+            raise web_cli.requests.RequestException("blocked the bot")
+
+    monkeypatch.setattr(web_cli.requests, "post", post)
     conf = cfg()
-    conf["notifications"]["telegram"].update(chat_id="1", click_notify=False)
-    assert click_notifier(conf) is None
+    conf["notifications"]["telegram"].update(
+        chat_id="-100group", click_notify=False, click_notify_to=["1", 2, "3"], names={"10": "Иван"}
+    )
+    assert web_cli.click_notifier(conf) is None  # switched off
     conf["notifications"]["telegram"]["click_notify"] = True
-    assert callable(click_notifier(conf))
-    conf["notifications"]["telegram"]["chat_id"] = ""
-    assert click_notifier(conf) is None
+    web_cli.click_notifier(conf)(lead(), "10")
+    assert sent == ["1", "2", "3"]  # a failing chat does not stop the others and the group is not used
+    conf["notifications"]["telegram"]["click_notify_to"] = []
+    assert web_cli.click_notifier(conf) is None
+
+
+def test_click_notify_to_is_validated():
+    conf = cfg()
+    conf["output"]["enabled"] = True
+    conf["notifications"]["telegram"]["click_notify_to"] = "1236451563"
+    with pytest.raises(ConfigError, match="click_notify_to"):
+        validate_config(conf, require_access=False)

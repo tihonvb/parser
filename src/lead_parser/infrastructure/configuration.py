@@ -135,6 +135,7 @@ DEFAULTS = {
             "claim_buttons": False,
             "track_clicks": False,
             "click_notify": False,
+            "click_notify_to": [],
             "names": {},
         }
     },
@@ -347,6 +348,10 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("notifications.telegram.claim_buttons: expected true or false")
     if type(tg.get("click_notify")) is not bool or type(cfg["web"].get("panel")) is not bool:
         raise ConfigError("notifications.telegram.click_notify and web.panel must be true/false")
+    if not isinstance(tg.get("click_notify_to"), list) or any(
+        type(item) not in {str, int} or not str(item).strip() for item in tg["click_notify_to"]
+    ):
+        raise ConfigError("notifications.telegram.click_notify_to: expected a list of chat ids")
     if type(tg.get("track_clicks")) is not bool or not isinstance(tg.get("names"), dict):
         raise ConfigError("notifications.telegram: track_clicks must be true/false, names a mapping")
     web = cfg["web"]

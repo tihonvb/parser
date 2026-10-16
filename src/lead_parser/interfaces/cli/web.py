@@ -29,24 +29,28 @@ def listen(cfg: dict, stop: threading.Event) -> None:
 
 
 def click_notifier(cfg: dict):
-    """Tell the admin chat that a recipient opened an order (first click only)."""
+    """Tell the admins (private chats) that a recipient opened an order; first click only."""
     tg = cfg["notifications"]["telegram"]
-    admin = str(tg["chat_id"]).strip()
-    if not (tg["click_notify"] and admin):
+    admins = [str(item).strip() for item in tg["click_notify_to"] if str(item).strip()]
+    if not (tg["click_notify"] and admins):
         return None
 
     def notify(lead, chat_id: str) -> None:
         who = tg["names"].get(chat_id) or chat_id
         title = " ".join(lead.text.split())[:90]
-        requests.post(
-            f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
-            json={
-                "chat_id": admin,
-                "text": f"👁 {who} открыл(а) заказ\n{title}",
-                "disable_web_page_preview": True,
-            },
-            timeout=(5, 10),
-        )
+        for admin in admins:  # one failing chat (e.g. the bot was never started there) must not stop the rest
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+                    json={
+                        "chat_id": admin,
+                        "text": f"👁 {who} открыл(а) заказ\n{title}",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=(5, 10),
+                )
+            except requests.RequestException:
+                pass
 
     return notify
 
