@@ -120,3 +120,11 @@ discovery:
   max_groups: 2000
   max_pages: 50
   days: 7
+
+# Кто какой заказ берёт: кнопки «Беру / Не беру» под сообщением и страница со списком (команда `lead-parser web`)
+# notifications.telegram.claim_buttons: true  -- включить кнопки (нужен запущенный `lead-parser web`)
+web:
+  host: 127.0.0.1     # наружу только через ssh-туннель или прокси с TLS
+  port: 8080
+  token: ""           # или переменная LEAD_WEB_TOKEN, не короче 16 символов
+  title: Заявки

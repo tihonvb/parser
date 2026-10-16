@@ -12,6 +12,7 @@ COMMANDS = {
     "vk-auth": "vk_token",
     "telegram-auth": "telegram_parser",
     "profi-mail": "profi_mail",
+    "web": "web",
     "migrate-sheet": "fix_sheet",
     "vk-discovery": "vk_discovery",
     "telegram-discovery": "telegram_discovery",

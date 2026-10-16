@@ -7,6 +7,7 @@ import requests
 from lead_parser.application.errors import DeliveryError
 from lead_parser.application.models import DeliveryJob
 from lead_parser.core.models import Lead
+from lead_parser.infrastructure.persistence.sqlite import claim_token
 from lead_parser.infrastructure.security import delivery_error
 
 
@@ -37,11 +38,26 @@ def _collect_chat_ids(settings: dict) -> list[str]:
     return list(dict.fromkeys(str(item).strip() for item in raw if item is not None and str(item).strip()))
 
 
+def keyboard(token: str, status: str | None = None) -> dict:
+    """Inline buttons under a lead: who takes it is tracked by lead_parser.infrastructure.integrations.telegram.claims."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": ("● " if status == "taken" else "") + "✅ Беру", "callback_data": f"t:{token}"},
+                {"text": ("● " if status == "skipped" else "") + "🚫 Не беру", "callback_data": f"s:{token}"},
+            ]
+        ]
+    }
+
+
 def send_to(cfg: dict, lead: Lead, chat_id: str) -> None:
     settings = cfg["notifications"]["telegram"]
+    body = {"chat_id": chat_id, "text": _format_message(lead), "disable_web_page_preview": True}
+    if settings.get("claim_buttons"):
+        body["reply_markup"] = keyboard(claim_token(lead.dedupe_key()))
     response = requests.post(
         f"https://api.telegram.org/bot{settings['bot_token']}/sendMessage",
-        json={"chat_id": chat_id, "text": _format_message(lead), "disable_web_page_preview": True},
+        json=body,
         timeout=(10, settings["timeout_seconds"]),
     )
     try:

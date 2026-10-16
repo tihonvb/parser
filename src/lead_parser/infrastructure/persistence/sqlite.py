@@ -23,6 +23,10 @@ from lead_parser.core.policies import unique_leads
 SCHEMA_VERSION = 1
 
 
+def claim_token(key: str) -> str:
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
 def _decode_lead(value: dict) -> Lead:
     return Lead(**{key: item for key, item in value.items() if key in Lead.__dataclass_fields__})
 
@@ -48,6 +52,10 @@ class Store:
               ai_next_at REAL NOT NULL DEFAULT 0, verdict TEXT, ai_error TEXT,
               first_seen REAL NOT NULL, last_seen REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS legacy_seen (key TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS claims (
+              lead_key TEXT NOT NULL REFERENCES leads(key), user_id TEXT NOT NULL,
+              user_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, updated REAL NOT NULL,
+              PRIMARY KEY(lead_key, user_id));
             CREATE TABLE IF NOT EXISTS human_reviews (
               lead_key TEXT PRIMARY KEY REFERENCES leads(key), is_client INTEGER NOT NULL,
               reviewed REAL NOT NULL);
@@ -431,6 +439,66 @@ class Store:
                 for r in self.db.execute("SELECT id,report,updated FROM sources ORDER BY id")
             ],
         }
+
+    def lead_key_by_token(self, token: str) -> str | None:
+        """Telegram callback data is limited to 64 bytes, so buttons carry a short digest of the lead key."""
+        for (key,) in self.db.execute("SELECT key FROM leads"):
+            if claim_token(key) == token:
+                return key
+        return None
+
+    def set_claim(
+        self, key: str, user_id: str, user_name: str, status: str, *, now: float | None = None
+    ) -> str | None:
+        """Mark a lead as taken/skipped by a user; pressing the same mark again clears it. Returns the new mark."""
+        if status not in {"taken", "skipped"}:
+            raise StorageError("Unknown claim status")
+        with self.transaction():
+            current = self.db.execute(
+                "SELECT status FROM claims WHERE lead_key=? AND user_id=?", (key, user_id)
+            ).fetchone()
+            if current and current["status"] == status:
+                self.db.execute("DELETE FROM claims WHERE lead_key=? AND user_id=?", (key, user_id))
+                return None
+            self.db.execute(
+                "INSERT INTO claims VALUES (?,?,?,?,?) ON CONFLICT(lead_key,user_id) DO UPDATE SET "
+                "user_name=excluded.user_name,status=excluded.status,updated=excluded.updated",
+                (key, user_id, user_name, status, time.time() if now is None else now),
+            )
+            return status
+
+    def claim_of(self, key: str, user_id: str) -> str | None:
+        row = self.db.execute(
+            "SELECT status FROM claims WHERE lead_key=? AND user_id=?", (key, user_id)
+        ).fetchone()
+        return row["status"] if row else None
+
+    def board(self, *, status: str = "", limit: int = 200) -> list[dict]:
+        """Leads that were sent to Telegram, newest first, with everyone's marks."""
+        rows = self.db.execute(
+            """SELECT l.key, l.payload, l.first_seen FROM leads l
+               WHERE EXISTS (SELECT 1 FROM deliveries d WHERE d.lead_key=l.key AND d.kind='telegram' AND d.state='done')
+               ORDER BY l.first_seen DESC"""
+        ).fetchall()
+        marks: dict[str, list[dict]] = {}
+        for claim in self.db.execute(
+            "SELECT lead_key,user_id,user_name,status,updated FROM claims ORDER BY updated"
+        ):
+            marks.setdefault(claim["lead_key"], []).append(dict(claim))
+        result = []
+        for row in rows:
+            lead = _decode_lead(json.loads(row["payload"]))
+            current = marks.get(row["key"], [])
+            if status == "taken" and not any(m["status"] == "taken" for m in current):
+                continue
+            if status == "free" and any(m["status"] == "taken" for m in current):
+                continue
+            result.append(
+                {"key": row["key"], "lead": lead, "first_seen": row["first_seen"], "claims": current}
+            )
+            if len(result) >= limit:
+                break
+        return result
 
     def backup(self, destination: str | Path) -> None:
         destination = Path(destination)

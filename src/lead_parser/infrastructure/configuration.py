@@ -126,8 +126,16 @@ DEFAULTS = {
         },
     },
     "notifications": {
-        "telegram": {"enabled": False, "bot_token": "", "chat_id": "", "chat_ids": [], "timeout_seconds": 10}
+        "telegram": {
+            "enabled": False,
+            "bot_token": "",
+            "chat_id": "",
+            "chat_ids": [],
+            "timeout_seconds": 10,
+            "claim_buttons": False,
+        }
     },
+    "web": {"host": "127.0.0.1", "port": 8080, "token": "", "title": "Заявки"},
     "schedule": {"interval_minutes": 60},
     "storage": {
         "database": ".data/parser.sqlite3",
@@ -154,6 +162,7 @@ ENV_MAP = {
     "GOOGLE_SPREADSHEET_ID": ("output", "google_sheets", "spreadsheet_id"),
     "TELEGRAM_BOT_TOKEN": ("notifications", "telegram", "bot_token"),
     "TELEGRAM_CHAT_ID": ("notifications", "telegram", "chat_id"),
+    "LEAD_WEB_TOKEN": ("web", "token"),
     "PROFI_MAIL_PASSWORD": ("profi_mail", "password"),
     "PROFI_MAIL_OAUTH_CLIENT_ID": ("profi_mail", "oauth", "client_id"),
 }
@@ -324,6 +333,16 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
         raise ConfigError("notifications.telegram.chat_ids: invalid recipients")
     if tg["enabled"] and not cfg["output"]["enabled"]:
         raise ConfigError("Notifications require Sheets delivery to be enabled")
+    if type(tg.get("claim_buttons")) is not bool:
+        raise ConfigError("notifications.telegram.claim_buttons: expected true or false")
+    web = cfg["web"]
+    if (
+        not isinstance(web, dict)
+        or not isinstance(web.get("host"), str)
+        or type(web.get("port")) is not int
+        or not 1 <= web["port"] <= 65535
+    ):
+        raise ConfigError("web: expected host (text) and port (1-65535)")
     _validate_profi_mail_static(cfg["profi_mail"])
     if not require_access:
         return
