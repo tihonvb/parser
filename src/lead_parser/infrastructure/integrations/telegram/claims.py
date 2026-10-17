@@ -81,3 +81,24 @@ def poll_once(cfg: dict, store: Store, *, wait: int = 25, api=_api) -> int:
             (OFFSET_KEY, str(offset)),
         )
     return handled
+
+
+def person_name(cfg: dict, store: Store, chat_id: str, api=_api) -> str:
+    """Readable name of a recipient: configured name, else the Telegram @nick / first name (cached), else the id."""
+    configured = cfg["notifications"]["telegram"]["names"].get(str(chat_id))
+    if configured:
+        return str(configured)
+    key = f"name:{chat_id}"
+    row = store.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if row:
+        return row["value"]
+    try:
+        chat = api(cfg, "getChat", {"chat_id": chat_id}, timeout=5).get("result") or {}
+    except Exception:
+        return str(chat_id)  # not cached: try again next time (e.g. the person has not started the bot yet)
+    name = f"@{chat['username']}" if chat.get("username") else display_name({"id": chat_id, **chat})
+    if name != str(chat_id):
+        store.db.execute(
+            "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, name)
+        )
+    return name

@@ -90,6 +90,7 @@ def make_handler(
     *,
     panel: bool = True,
     on_first_click=None,
+    name_of=None,
 ):
     if len(token) < 16:
         raise ValueError("web token must be at least 16 characters")
@@ -118,7 +119,12 @@ def make_handler(
             status = (query.get("status") or [""])[0]
             status = status if status in STATUSES else ""
             with Store(db_path) as store:
-                page = render(store.board(status=status), status, title, names)
+                rows = store.board(status=status)
+                shown = dict(names or {})
+                if name_of:
+                    for chat in {r["chat_id"] for row in rows for r in row["recipients"]}:
+                        shown[chat] = name_of(store, chat)
+                page = render(rows, status, title, shown)
             headers = {}
             if (query.get("key") or [""])[0]:
                 headers["Set-Cookie"] = f"key={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000"

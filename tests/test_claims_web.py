@@ -361,3 +361,30 @@ def test_click_notify_to_is_validated():
     conf["notifications"]["telegram"]["click_notify_to"] = "1236451563"
     with pytest.raises(ConfigError, match="click_notify_to"):
         validate_config(conf, require_access=False)
+
+
+def test_person_name_prefers_config_then_nick_and_caches(store):
+    calls = []
+
+    def api(cfg, method, payload, **kw):
+        calls.append(payload["chat_id"])
+        return {"ok": True, "result": {"username": "ivan_k", "first_name": "Иван"}}
+
+    conf = cfg()
+    conf["notifications"]["telegram"]["names"] = {"7": "Пётр"}
+    assert claims.person_name(conf, store, "7", api) == "Пётр" and not calls
+    assert claims.person_name(conf, store, "10", api) == "@ivan_k"
+    assert claims.person_name(conf, store, "10", api) == "@ivan_k" and calls == ["10"]  # cached
+    no_nick = lambda *a, **k: {"ok": True, "result": {"first_name": "Анна", "last_name": "Ли"}}  # noqa: E731
+    assert claims.person_name(conf, store, "11", no_nick) == "Анна Ли"
+
+
+def test_person_name_falls_back_to_id_without_caching(store):
+    def broken(*a, **k):
+        raise RuntimeError("403")
+
+    assert claims.person_name(cfg(), store, "55", broken) == "55"
+    assert store.db.execute("SELECT count(*) FROM meta WHERE key='name:55'").fetchone()[0] == 0
+    only_id = lambda *a, **k: {"ok": True, "result": {}}  # noqa: E731
+    assert claims.person_name(cfg(), store, "56", only_id) == "56"
+    assert store.db.execute("SELECT count(*) FROM meta WHERE key='name:56'").fetchone()[0] == 0

@@ -9,7 +9,7 @@ from http.server import ThreadingHTTPServer
 import requests
 
 from lead_parser.infrastructure.configuration import CONFIG_PATH, load_config
-from lead_parser.infrastructure.integrations.telegram.claims import poll_once
+from lead_parser.infrastructure.integrations.telegram.claims import person_name, poll_once
 from lead_parser.infrastructure.persistence.sqlite import Store
 from lead_parser.interfaces.web.app import make_handler
 
@@ -36,7 +36,8 @@ def click_notifier(cfg: dict):
         return None
 
     def notify(lead, chat_id: str) -> None:
-        who = tg["names"].get(chat_id) or chat_id
+        with Store(cfg["storage"]["database"]) as store:
+            who = person_name(cfg, store, chat_id)
         title = " ".join(lead.text.split())[:90]
         for admin in admins:  # one failing chat (e.g. the bot was never started there) must not stop the rest
             try:
@@ -68,6 +69,7 @@ def main(argv=None):
         cfg["notifications"]["telegram"]["names"],
         panel=web["panel"],
         on_first_click=click_notifier(cfg),
+        name_of=lambda store, chat: person_name(cfg, store, chat),
     )
     stop = threading.Event()
     tg = cfg["notifications"]["telegram"]
