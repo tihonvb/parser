@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from deploy import install_release as installer
+from lead_parser.infrastructure.persistence.schema import migrate_database
 
 SHA = "a" * 40
 VERSION = "0.2.0"
@@ -53,7 +54,10 @@ class Host:
         self.lock = options.config.parent / "parser.lock"
         self.config_before = options.config.read_bytes()
         self.needs_chromium = False
-        self.schema_version = 1
+        self.schema_version = 2
+        self.web_present = False
+        self.web_required = False
+        self.web_active = False
         self.change_schema = False
         self.probed = None
         self.service_states = []
@@ -63,18 +67,29 @@ class Host:
         stage = None
         output = ""
         if argv[:2] == ["systemctl", "show"]:
-            if "--property=User" in argv:
+            if "--property=LoadState" in argv:
+                output = "loaded" if self.web_present else "not-found"
+            elif "--property=User" in argv:
                 output = f"User={pwd.getpwuid(os.getuid()).pw_name}\nGroup=\n"
             elif argv[2] == self.options.timer:
                 output = "active" if self.timer_active else "inactive"
+            elif argv[2] == self.options.web_service:
+                output = "active" if self.web_active else "inactive"
             else:
                 output = self.service_states.pop(0) if self.service_states else "inactive"
         elif argv[:2] == ["systemctl", "stop"]:
-            assert argv[2] == self.options.timer, "Deployment must never interrupt an active run"
-            self.timer_active = False
+            assert argv[2] in {self.options.timer, self.options.web_service}, "Do not interrupt a parser run"
+            if argv[2] == self.options.timer:
+                self.timer_active = False
+            else:
+                self.web_active = False
         elif argv[:2] == ["systemctl", "start"]:
-            self.timer_active = True
-            stage = "start"
+            if argv[2] == self.options.web_service:
+                self.web_active = True
+                stage = "web_start"
+            else:
+                self.timer_active = True
+                stage = "start"
         elif "--require-hashes" in argv:
             stage = "pip"
         elif "--check-config" in argv:
@@ -86,23 +101,32 @@ class Host:
                     "lock_file": str(self.lock),
                     "paths": [str(self.database), str(self.lock)],
                     "needs_chromium": self.needs_chromium,
+                    "web_required": self.web_required,
+                    "health_url": "http://127.0.0.1:8080/healthz",
                 }
             )
         elif installer.SNAPSHOT_PROBE in argv:
-            stage = "snapshot"
-            self.probed = Path(argv[-1])
-            assert self.probed != self.database
-            assert not self.timer_active
-            # The app lock must cover both snapshot validation and switching.
+            target = Path(argv[-1])
+            stage = "migration" if target == self.database else "snapshot"
+            assert not self.timer_active and not self.web_active
             with pytest.raises(installer.DeployError, match="lock"):
                 with installer.exclusive_lock(self.lock):
                     pytest.fail("Application lock was not held")
-            with sqlite3.connect(self.probed) as snapshot:
-                snapshot.execute(f"PRAGMA user_version={self.schema_version}")
-                if self.change_schema:
-                    snapshot.execute("CREATE TABLE disposable_probe (value TEXT)")
-                if self.database.exists():
-                    snapshot.execute("UPDATE sent SET message='candidate touched only this copy'")
+            with pytest.raises(installer.DeployError, match="lock"):
+                with installer.exclusive_lock(Path(str(self.lock) + ".web")):
+                    pytest.fail("Web lock was not held")
+            output = json.dumps(migrate_database(target, initialize=True))
+            if stage == "snapshot":
+                self.probed = target
+                with sqlite3.connect(target) as snapshot:
+                    snapshot.execute(f"PRAGMA user_version={self.schema_version}")
+                    if self.change_schema:
+                        snapshot.execute("CREATE TABLE disposable_probe (value TEXT)")
+                    if self.database.exists():
+                        snapshot.execute("UPDATE leads SET payload='candidate touched only this copy'")
+        elif installer.HEALTH_PROBE in argv:
+            assert self.web_active and not self.timer_active
+            stage = "health"
         code = 1 if stage and stage == self.fail else 0
         return subprocess.CompletedProcess(argv, code, stdout=output, stderr="secret API token")
 
@@ -133,16 +157,18 @@ def old_release(options):
 
 def seed_database(host):
     with sqlite3.connect(host.database) as db:
-        db.execute("PRAGMA user_version=1")
-        db.execute("CREATE TABLE sent (message TEXT)")
-        db.execute("INSERT INTO sent VALUES ('keep delivery history')")
+        db.executescript((Path(__file__).parent / "fixtures/schema-v1.sql").read_text())
+        db.execute(
+            "INSERT INTO leads(key,payload,content_hash,ai_state,first_seen,last_seen) "
+            "VALUES('vk:legacy','keep delivery history','hash','accepted',1,2)"
+        )
 
 
-def assert_live_preserved(host):
+def assert_live_preserved(host, version=1):
     assert host.options.config.read_bytes() == host.config_before
     with sqlite3.connect(host.database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert db.execute("SELECT message FROM sent").fetchall() == [("keep delivery history",)]
+        assert db.execute("PRAGMA user_version").fetchone()[0] == version
+        assert db.execute("SELECT payload FROM leads").fetchall() == [("keep delivery history",)]
 
 
 def test_success_uses_backup_then_atomic_switch_and_preserves_runtime(options):
@@ -155,10 +181,10 @@ def test_success_uses_backup_then_atomic_switch_and_preserves_runtime(options):
     assert receipt["sha"] == SHA
     with sqlite3.connect(receipt["backup"]) as backup:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert backup.execute("SELECT message FROM sent").fetchone()[0] == "keep delivery history"
+        assert backup.execute("SELECT payload FROM leads").fetchone()[0] == "keep delivery history"
     assert Path(receipt["backup"]).stat().st_mode & 0o777 == 0o600
     assert host.timer_active
-    assert_live_preserved(host)
+    assert_live_preserved(host, version=2)
     assert host.probed and not host.probed.exists()
     assert not any("playwright" in argv for argv in host.calls)
     assert not any("--deliver-only" in argv for argv in host.calls)
@@ -170,7 +196,7 @@ def test_repeat_completed_release_is_idempotent(options):
     host.calls.clear()
     assert installer.deploy(options, runner=host) == receipt
     assert len(host.calls) == 1  # Only systemd runtime identity is inspected.
-    assert not host.database.exists()
+    assert host.database.exists()
 
 
 def test_disabled_timer_stays_disabled_and_chromium_is_conditional(options):
@@ -182,7 +208,7 @@ def test_disabled_timer_stays_disabled_and_chromium_is_conditional(options):
     assert any(argv[-4:] == ["-m", "playwright", "install", "chromium"] for argv in host.calls)
 
 
-@pytest.mark.parametrize("stage", ["pip", "config", "snapshot"])
+@pytest.mark.parametrize("stage", ["pip", "config", "snapshot", "migration"])
 def test_pre_activation_failure_preserves_old_release_and_schedule(options, stage):
     previous = old_release(options)
     host = Host(options, fail=stage)
@@ -205,7 +231,7 @@ def test_activation_failure_stops_schedule_without_unsafe_code_or_db_rollback(op
         installer.deploy(options, runner=host)
     assert (options.root / "current").resolve() != previous
     assert not host.timer_active
-    assert_live_preserved(host)
+    assert_live_preserved(host, version=2)
     host.fail = None
     with pytest.raises(installer.DeployError, match="already exists"):
         installer.deploy(options, runner=host)
@@ -227,9 +253,9 @@ def test_automatic_schema_migration_rejected_before_switch(options, change_schem
     if change_schema:
         host.change_schema = True
     else:
-        host.schema_version = 2
+        host.schema_version = 3
     seed_database(host)
-    with pytest.raises(installer.DeployError, match="explicit migration"):
+    with pytest.raises(installer.DeployError, match="(schema|migration)"):
         installer.deploy(options, runner=host)
     assert (options.root / "current").resolve() == previous
     assert host.timer_active
@@ -463,3 +489,124 @@ def test_config_checks_use_systemd_explicit_primary_group(options, monkeypatch):
     probes = [argv for argv in host.calls if argv[0] == "runuser"]
     assert len(probes) == 2
     assert all(argv[:6] == ["runuser", "-u", "runtime-user", "-g", "runtime-group", "--"] for argv in probes)
+
+
+def test_web_upgrade_stops_writers_migrates_then_checks_health_before_timer(options):
+    host = Host(options)
+    host.web_present = host.web_required = host.web_active = True
+    seed_database(host)
+    previous = old_release(options)
+    receipt = installer.deploy(options, runner=host)
+    assert receipt["previous"] == str(previous)
+    assert receipt["migration"]["from_version"] == 1
+    assert receipt["web_required"] and host.web_active and host.timer_active
+    assert_live_preserved(host, version=2)
+    stops = [argv[:3] for argv in host.calls if argv[:2] == ["systemctl", "stop"]]
+    assert stops == [["systemctl", "stop", options.timer], ["systemctl", "stop", options.web_service]]
+    starts = [argv[2] for argv in host.calls if argv[:2] == ["systemctl", "start"]]
+    assert starts == [options.web_service, options.timer]
+
+
+@pytest.mark.parametrize("stage", ["web_start", "health", "start"])
+def test_any_activation_failure_preserves_new_database_and_stops_both_services(options, stage):
+    host = Host(options, fail=stage)
+    host.web_present = host.web_required = host.web_active = True
+    previous = old_release(options)
+    seed_database(host)
+    with pytest.raises(installer.DeployError, match="candidate remains current"):
+        installer.deploy(options, runner=host)
+    assert (options.root / "current").resolve() != previous
+    assert not host.web_active and not host.timer_active
+    assert_live_preserved(host, version=2)
+
+
+def test_live_migration_failure_restores_database_before_old_services_restart(options):
+    host = Host(options, fail="migration")
+    host.web_present = host.web_required = host.web_active = True
+    previous = old_release(options)
+    seed_database(host)
+    with pytest.raises(installer.DeployError):
+        installer.deploy(options, runner=host)
+    assert (options.root / "current").resolve() == previous
+    assert host.web_active and host.timer_active
+    assert_live_preserved(host, version=1)
+    with sqlite3.connect(host.database) as db:
+        assert db.execute("SELECT name FROM sqlite_schema WHERE name='claims'").fetchone() is None
+
+
+def test_missing_required_web_unit_fails_before_stopping_schedule(options):
+    host = Host(options)
+    host.web_required = True
+    with pytest.raises(installer.DeployError, match="Install parser-web.service"):
+        installer.deploy(options, runner=host)
+    assert not any(argv[:2] == ["systemctl", "stop"] for argv in host.calls)
+    assert host.timer_active
+
+
+def test_disabling_web_stops_old_process_and_does_not_restart_it(options):
+    host = Host(options, timer_active=False)
+    host.web_present = host.web_active = True
+    installer.deploy(options, runner=host)
+    assert not host.web_active and not host.timer_active
+    assert not any(installer.HEALTH_PROBE in argv for argv in host.calls)
+
+
+def test_manual_web_lock_prevents_migration_and_activation(options):
+    host = Host(options)
+    previous = old_release(options)
+    seed_database(host)
+    with installer.exclusive_lock(Path(str(host.lock) + ".web")):
+        with pytest.raises(installer.DeployError, match="lock"):
+            installer.deploy(options, runner=host)
+    assert (options.root / "current").resolve() == previous
+    assert_live_preserved(host)
+
+
+def test_schema_guard_rejects_a_change_to_existing_table(options):
+    host = Host(options)
+    seed_database(host)
+    before = installer.database_schema(host.database)
+    with sqlite3.connect(host.database) as db:
+        db.execute("PRAGMA user_version=2")
+        db.execute("ALTER TABLE leads ADD COLUMN surprise TEXT")
+    with pytest.raises(installer.DeployError, match="Unexpected schema"):
+        installer.validate_schema_transition(before, installer.database_schema(host.database))
+
+
+def test_failure_to_stop_timer_after_activation_still_stops_web(options):
+    class StopFailure(Host):
+        health_failed = False
+
+        def __call__(self, argv, **kw):
+            result = super().__call__(argv, **kw)
+            if installer.HEALTH_PROBE in argv:
+                self.health_failed = True
+            if self.health_failed and argv[:3] == ["systemctl", "stop", self.options.timer]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="failure")
+            return result
+
+    host = StopFailure(options, fail="health")
+    host.web_present = host.web_required = host.web_active = True
+    with pytest.raises(installer.DeployError, match="Cannot confirm all services stopped"):
+        installer.deploy(options, runner=host)
+    assert not host.web_active
+    assert host.calls[-1][:3] == ["systemctl", "stop", options.web_service]
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="Ownership check requires root")
+def test_restoring_old_schema_preserves_runtime_ownership_and_history(tmp_path):
+    database, backup = tmp_path / "live.sqlite3", tmp_path / "backup.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.executescript((Path(__file__).parent / "fixtures/schema-v1.sql").read_text())
+        db.execute("INSERT INTO meta VALUES('offset','before')")
+    installer.sqlite_snapshot(database, backup)
+    migrate_database(database)
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE meta SET value='after'")
+    os.chown(database, 65534, 65534)
+    installer.restore_database(backup, database, ("nobody", 65534, 65534))
+    with sqlite3.connect(database) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("SELECT value FROM meta").fetchone()[0] == "before"
+    assert database.stat().st_uid == 65534 and database.stat().st_mode & 0o777 == 0o600

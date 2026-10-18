@@ -1,7 +1,7 @@
 name: Parser checks
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: ['**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -40,6 +40,16 @@ jobs:
       - run: uv run --locked lead-parser --config config.example.yaml --check-config
       - run: uv run --locked lead-parser evaluate --config config.example.yaml --output reports/offline.json
       - run: uv run --locked python scripts/check_secrets.py
+      - name: Verify systemd unit syntax
+        shell: bash
+        run: |
+          parser_unit_dir="$(mktemp -d)"
+          # Unit paths refer to the production install; only executable existence is substituted here.
+          for unit in parser.service parser-web.service; do
+            sed 's|/opt/parser/current/.venv/bin/lead-parser|/usr/bin/true|g' "deploy/$unit" > "$parser_unit_dir/$unit"
+          done
+          cp deploy/parser.timer "$parser_unit_dir/parser.timer"
+          systemd-analyze verify "$parser_unit_dir/parser.service" "$parser_unit_dir/parser-web.service" "$parser_unit_dir/parser.timer"
       - name: Build and smoke-test installed wheel outside checkout
         shell: bash
         run: |
@@ -69,6 +79,9 @@ jobs:
           assert files("lead_parser.resources").joinpath("evaluation.jsonl").is_file()
           assert not Path(".data").exists()
           PY
+          "$parser_wheel_env/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_web.py" \
+            --config-template config.yaml \
+            --legacy-schema "$GITHUB_WORKSPACE/tests/fixtures/schema-v1.sql"
       - name: Verify exported runtime dependencies
         run: |
           uv export --locked --no-dev --no-emit-project --no-header --output-file /tmp/parser-requirements.txt > /dev/null

@@ -20,9 +20,9 @@ from lead_parser.application.errors import StorageError
 from lead_parser.application.models import ClassifiedLead, DeliveryPlan, LeadStatisticsRecord, ScanResult
 from lead_parser.core.models import Lead
 from lead_parser.core.policies import unique_leads
+from lead_parser.infrastructure.persistence.schema import SCHEMA_VERSION as SCHEMA_VERSION
+from lead_parser.infrastructure.persistence.schema import initialize_or_validate
 from lead_parser.infrastructure.tracking import click_token
-
-SCHEMA_VERSION = 1
 
 
 def claim_token(key: str) -> str:
@@ -36,52 +36,22 @@ def _decode_lead(value: dict) -> Lead:
 class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
+            pass
         self.db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=30000")
-        version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {0, SCHEMA_VERSION}:
+        try:
+            initialize_or_validate(self.db)
+        except BaseException:
             self.db.close()
-            raise StorageError("Unsupported database schema; use the documented migration")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS leads (
-              key TEXT PRIMARY KEY, payload TEXT NOT NULL, content_hash TEXT NOT NULL,
-              ai_state TEXT NOT NULL DEFAULT 'pending', ai_attempts INTEGER NOT NULL DEFAULT 0,
-              ai_next_at REAL NOT NULL DEFAULT 0, verdict TEXT, ai_error TEXT,
-              first_seen REAL NOT NULL, last_seen REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS legacy_seen (key TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS clicks (
-              lead_key TEXT NOT NULL REFERENCES leads(key), chat_id TEXT NOT NULL,
-              first_at REAL NOT NULL, last_at REAL NOT NULL, count INTEGER NOT NULL,
-              PRIMARY KEY(lead_key, chat_id));
-            CREATE TABLE IF NOT EXISTS claims (
-              lead_key TEXT NOT NULL REFERENCES leads(key), user_id TEXT NOT NULL,
-              user_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, updated REAL NOT NULL,
-              PRIMARY KEY(lead_key, user_id));
-            CREATE TABLE IF NOT EXISTS human_reviews (
-              lead_key TEXT PRIMARY KEY REFERENCES leads(key), is_client INTEGER NOT NULL,
-              reviewed REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS sources (
-              id TEXT PRIMARY KEY, cursor TEXT NOT NULL DEFAULT '{}', report TEXT NOT NULL DEFAULT '{}',
-              updated REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS deliveries (
-              id INTEGER PRIMARY KEY AUTOINCREMENT, lead_key TEXT NOT NULL REFERENCES leads(key),
-              kind TEXT NOT NULL, destination TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
-              attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
-              lease_owner TEXT, lease_until REAL, last_error TEXT, sheet_row INTEGER,
-              depends_on INTEGER REFERENCES deliveries(id), created REAL NOT NULL, delivered REAL,
-              UNIQUE(lead_key, kind, destination));
-            CREATE UNIQUE INDEX IF NOT EXISTS sheet_slots ON deliveries(destination,sheet_row)
-              WHERE kind='sheets' AND sheet_row IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS delivery_due ON deliveries(state,next_at);
-            CREATE INDEX IF NOT EXISTS ai_due ON leads(ai_state,ai_next_at);
-        """)
-        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            raise
         if os.name == "posix":
             os.chmod(self.path, 0o600)
             for suffix in ("-wal", "-shm"):

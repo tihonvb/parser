@@ -388,3 +388,34 @@ def test_person_name_falls_back_to_id_without_caching(store):
     only_id = lambda *a, **k: {"ok": True, "result": {}}  # noqa: E731
     assert claims.person_name(cfg(), store, "56", only_id) == "56"
     assert store.db.execute("SELECT count(*) FROM meta WHERE key='name:56'").fetchone()[0] == 0
+
+
+def test_health_has_no_lead_data_and_fails_when_schema_needs_migration(server, store):
+    import json
+    from importlib.metadata import version
+
+    health = json.load(get(f"{server}/healthz"))
+    assert health == {"status": "ok", "schema_version": 2, "version": version("remont-lead-parser")}
+    store.db.execute("PRAGMA user_version=1")
+    with pytest.raises(HTTPError) as error:
+        get(f"{server}/healthz")
+    assert error.value.code == 503
+    assert json.load(error.value) == {"status": "unavailable"}
+    assert store.db.execute("PRAGMA user_version").fetchone()[0] == 1
+    store.db.execute("PRAGMA user_version=2")
+
+
+def test_systemd_condition_is_offline_and_does_not_create_database(cfg, tmp_path):
+    import yaml
+
+    from lead_parser.interfaces.cli.web import main
+
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(copy.deepcopy(DEFAULTS)))
+    assert main(["--config", str(path), "--check-enabled"]) == 1
+    assert not (tmp_path / ".data").exists()
+    conf = copy.deepcopy(DEFAULTS)
+    conf["web"].update(enabled=True, token=TOKEN)
+    path.write_text(yaml.safe_dump(conf))
+    assert main(["--config", str(path), "--check-enabled"]) == 0
+    assert not (tmp_path / ".data").exists()

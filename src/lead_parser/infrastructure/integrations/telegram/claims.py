@@ -74,8 +74,10 @@ def poll_once(cfg: dict, store: Store, *, wait: int = 25, api=_api) -> int:
         if isinstance(update.get("callback_query"), dict):
             try:
                 handled += handle_callback(cfg, store, update["callback_query"], api)
-            except Exception:
-                log.exception("callback failed")  # never block the queue on one bad press
+            except Exception as error:
+                log.warning(
+                    "callback failed: %s", type(error).__name__
+                )  # never block the queue on one bad press
         store.db.execute(
             "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (OFFSET_KEY, str(offset)),

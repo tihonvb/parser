@@ -39,26 +39,50 @@ class DeployOptions:
     python: Path = Path("/usr/bin/python3.12")
     service: str = "parser.service"
     timer: str = "parser.timer"
+    web_service: str = "parser-web.service"
+    health_seconds: float = 30
     wait_seconds: float = 900
 
 
 CONFIG_PROBE = """
 import json, sys
-from lead_parser.infrastructure.configuration import load_config
+from lead_parser.infrastructure.configuration import load_config, web_required
 cfg = load_config(sys.argv[1])
 paths = [cfg['storage'][key] for key in ('database', 'lock_file', 'seen_store')]
 paths += [cfg['telegram']['session_name'], cfg['vk']['token_file'], cfg['vk']['state_file']]
-paths += [cfg['output']['google_sheets']['credentials_file']]
+paths += [cfg['output']['google_sheets']['credentials_file'], cfg['profi_mail']['oauth']['token_file']]
+host = cfg['web']['host']
+host = '127.0.0.1' if host in ('0.0.0.0', '') else '::1' if host == '::' else host
+host = '[' + host + ']' if ':' in host else host
 print(json.dumps({'database': cfg['storage']['database'], 'lock_file': cfg['storage']['lock_file'],
-                  'paths': paths, 'needs_chromium': bool(cfg['avito']['enabled']
+                  'paths': paths, 'web_required': web_required(cfg),
+                  'health_url': 'http://' + host + ':' + str(cfg['web']['port']) + '/healthz',
+                  'needs_chromium': bool(cfg['avito']['enabled']
                   and not cfg['avito']['cdp_endpoint'] and not cfg['avito']['dolphin']['enabled'])}))
 """
 
 SNAPSHOT_PROBE = """
-import sys
-from lead_parser.infrastructure.persistence.sqlite import Store
-with Store(sys.argv[1]) as store:
-    store.summary()
+import json, sys
+from lead_parser.infrastructure.persistence.schema import migrate_database
+print(json.dumps(migrate_database(sys.argv[1], initialize=True)))
+"""
+
+HEALTH_PROBE = """
+import json, sys, time
+from urllib.request import urlopen
+url, version, timeout = sys.argv[1:]
+deadline = time.monotonic() + float(timeout)
+while True:
+    try:
+        with urlopen(url, timeout=2) as response:
+            data = json.load(response)
+        if data == {'status': 'ok', 'schema_version': 2, 'version': version}:
+            break
+    except Exception:
+        pass
+    if time.monotonic() >= deadline:
+        raise SystemExit(1)
+    time.sleep(0.5)
 """
 
 
@@ -78,10 +102,14 @@ def validate_options(options):
         raise DeployError("SHA must be 40 lowercase hexadecimal characters")
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", options.version):
         raise DeployError("Version must be stable X.Y.Z")
-    for unit, suffix in ((options.service, "service"), (options.timer, "timer")):
+    for unit, suffix in (
+        (options.service, "service"),
+        (options.timer, "timer"),
+        (options.web_service, "service"),
+    ):
         if not re.fullmatch(r"[A-Za-z0-9_-]+\." + suffix, unit):
             raise DeployError("Invalid systemd unit name")
-    if options.wait_seconds <= 0:
+    if options.wait_seconds <= 0 or options.health_seconds <= 0:
         raise DeployError("Wait timeout must be positive")
     if not options.config.is_absolute() or not options.root.is_absolute() or not options.python.is_absolute():
         raise DeployError("Root, config and Python paths must be absolute")
@@ -252,9 +280,7 @@ def prepare_release(options, release, runner, identity):
         runner, [python, "-m", "pip", "install", "--require-hashes", "-r", str(release / "requirements.txt")]
     )
     command(runner, [python, "-m", "pip", "install", "--no-deps", str(wheel)])
-    prefix = []
-    if os.geteuid() == 0 and (identity[1] != 0 or identity[2] != os.getegid()):
-        prefix = ["runuser", "-u", identity[0], "-g", grp.getgrgid(identity[2]).gr_name, "--"]
+    prefix = runtime_prefix(identity)
     command(
         runner,
         prefix + [python, "-m", "lead_parser", "--config", str(options.config), "--check-config"],
@@ -274,6 +300,66 @@ def prepare_release(options, release, runner, identity):
     return cfg, python, env
 
 
+def runtime_prefix(identity):
+    if os.geteuid() == 0 and (identity[1] != 0 or identity[2] != os.getegid()):
+        return ["runuser", "-u", identity[0], "-g", grp.getgrgid(identity[2]).gr_name, "--"]
+    return []
+
+
+def validate_schema_transition(before, after):
+    if after[0] != 2:
+        raise DeployError("Candidate must use supported SQLite schema 2")
+    if before is None or before == after:
+        return
+    if before[0] not in {0, 1}:
+        raise DeployError("Unexpected schema change; perform an explicit migration first")
+    old = {(row[0], row[1]): row[2:] for row in before[1]}
+    new = {(row[0], row[1]): row[2:] for row in after[1]}
+    allowed_names = {
+        "leads",
+        "deliveries",
+        "sources",
+        "legacy_seen",
+        "human_reviews",
+        "meta",
+        "claims",
+        "clicks",
+        "sheet_slots",
+        "delivery_due",
+        "ai_due",
+        "sqlite_sequence",
+        "sqlite_autoindex_leads_1",
+        "sqlite_autoindex_deliveries_1",
+        "sqlite_autoindex_sources_1",
+        "sqlite_autoindex_legacy_seen_1",
+        "sqlite_autoindex_human_reviews_1",
+        "sqlite_autoindex_meta_1",
+        "sqlite_autoindex_claims_1",
+        "sqlite_autoindex_clicks_1",
+    }
+    if any(new.get(key) != value for key, value in old.items()) or any(
+        name not in allowed_names or kind not in {"table", "index"} for kind, name in new.keys() - old.keys()
+    ):
+        raise DeployError("Unexpected schema change; perform an explicit migration first")
+
+
+def restore_database(backup, database, identity):
+    """Restore only before new services have started, with both writer locks held."""
+    try:
+        with closing(sqlite3.connect(backup.as_uri() + "?mode=ro", uri=True)) as source:
+            with closing(sqlite3.connect(database)) as target:
+                source.backup(target)
+    except sqlite3.Error as error:
+        raise DeployError("Database restore failed; keep all services stopped") from error
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            path = Path(str(database) + suffix)
+            if path.exists():
+                if os.geteuid() == 0:
+                    os.chown(path, *identity[1:])
+                path.chmod(0o600)
+
+
 def deploy(options, *, runner=subprocess.run):
     validate_options(options)
     options = replace(options, root=options.root.resolve())
@@ -287,7 +373,6 @@ def deploy(options, *, runner=subprocess.run):
         release = root / "releases" / f"{options.version}-{options.sha[:12]}"
         previous = current.resolve(strict=True) if current.is_symlink() else None
         if release.exists():
-            # Completed repeat is idempotent; partial attempts are preserved for inspection.
             receipt_path = release / "deployment.json"
             if previous == release and receipt_path.is_file():
                 receipt = json.loads(receipt_path.read_text())
@@ -300,44 +385,105 @@ def deploy(options, *, runner=subprocess.run):
             raise DeployError("Release directory already exists; inspect the previous attempt")
         attempts.enter_context(release_attempt(release, current))
         cfg, python, env = prepare_release(options, release, runner, identity)
+        prefix = runtime_prefix(identity)
+        web_state = command(
+            runner,
+            ["systemctl", "show", options.web_service, "--property=LoadState", "--value"],
+            allowed=(0, 1),
+        )
+        if web_state not in {"loaded", "not-found"}:
+            raise DeployError("Cannot determine web service installation state")
+        web_present = web_state == "loaded"
+        if cfg["web_required"] and not web_present:
+            raise DeployError("Install parser-web.service before deploying enabled web features")
+        if web_present:
+            if runtime_identity(runner, options.web_service) != identity:
+                raise DeployError("Parser and web services must use the same runtime user/group")
+        web_active = web_present and service_state(runner, options.web_service) == "active"
         timer_active = service_state(runner, options.timer) == "active"
-        stopped = switched = activation_attempted = False
+        stopped = switched = activation_attempted = database_touched = False
         backup = None
+        database = Path(cfg["database"])
+        database_existed = database.exists()
+
+        @contextmanager
+        def writer_locks():
+            with exclusive_lock(Path(cfg["lock_file"]), timeout=options.wait_seconds, identity=identity[1:]):
+                with exclusive_lock(
+                    Path(cfg["lock_file"] + ".web"), timeout=options.wait_seconds, identity=identity[1:]
+                ):
+                    yield
+
+        def stop_managed():
+            failures = []
+            for unit in [options.timer] + ([options.web_service] if web_present else []):
+                try:
+                    command(runner, ["systemctl", "stop", unit])
+                except Exception as failure:
+                    failures.append(failure)
+            if failures:
+                raise DeployError(
+                    "Cannot confirm all services stopped; inspect before resuming"
+                ) from failures[0]
+
         try:
-            # Mark before issuing stop: a transport/process error may follow a successful stop.
             stopped = True
             command(runner, ["systemctl", "stop", options.timer])
             wait_service(runner, options.service, options.wait_seconds)
-            with exclusive_lock(Path(cfg["lock_file"]), timeout=options.wait_seconds, identity=identity[1:]):
-                database = Path(cfg["database"])
+            if web_present:
+                command(runner, ["systemctl", "stop", options.web_service])
+                wait_service(runner, options.web_service, options.wait_seconds)
+            with writer_locks():
                 backups = root / "backups"
                 backups.mkdir(mode=0o700, exist_ok=True)
-                if database.exists():
+                if database_existed:
                     backup = backups / f"{options.version}-{options.sha[:12]}-{uuid.uuid4().hex}.sqlite3"
                     sqlite_snapshot(database, backup)
-                # Candidate Store can create/migrate a disposable copy, never the live database.
+                before = database_schema(backup) if backup else None
                 with tempfile.TemporaryDirectory(prefix=".preflight-", dir=backups) as temporary:
                     snapshot = Path(temporary) / "parser.sqlite3"
                     if backup:
                         shutil.copyfile(backup, snapshot)
-                    before = database_schema(snapshot) if backup else None
                     command(runner, [python, "-c", SNAPSHOT_PROBE, str(snapshot)], env=env)
-                    if before is not None and database_schema(snapshot) != before:
-                        raise DeployError(
-                            "Release changes SQLite schema; perform an explicit migration first"
-                        )
+                    expected = database_schema(snapshot)
+                    validate_schema_transition(before, expected)
+                # The same audited migration now runs on the live DB, as runtime user, after backup.
+                database_touched = True
+                migration = json.loads(
+                    command(runner, prefix + [python, "-c", SNAPSHOT_PROBE, str(database)], env=env)
+                )
+                if database_schema(database) != expected:
+                    raise DeployError("Live migration differs from the verified snapshot")
                 receipt = {
                     "sha": options.sha,
                     "version": options.version,
                     "release": str(release),
                     "previous": str(previous) if previous else None,
                     "backup": str(backup) if backup else None,
+                    "migration": migration,
+                    "web_required": cfg["web_required"],
                     "status": "prepared",
                 }
                 atomic_symlink(release, current)
                 switched = True
-                # Write receipt while app lock is held, before a timer can start the new code.
                 write_receipt(release / "deployment.json", receipt)
+            if cfg["web_required"]:
+                activation_attempted = True
+                command(runner, ["systemctl", "start", options.web_service])
+                if service_state(runner, options.web_service) != "active":
+                    raise DeployError("Web service did not start")
+                command(
+                    runner,
+                    [
+                        python,
+                        "-c",
+                        HEALTH_PROBE,
+                        cfg["health_url"],
+                        options.version,
+                        str(options.health_seconds),
+                    ],
+                    env=env,
+                )
             if timer_active:
                 activation_attempted = True
                 command(runner, ["systemctl", "start", options.timer])
@@ -345,28 +491,35 @@ def deploy(options, *, runner=subprocess.run):
             write_receipt(release / "deployment.json", receipt)
             return receipt
         except BaseException as error:
-            try:
-                if activation_attempted:
-                    # A failed start may already have launched new code. Never roll code or DB back now.
-                    command(runner, ["systemctl", "stop", options.timer])
-                    raise DeployError(
-                        "Timer activation failed; candidate remains current and timer is stopped; inspect before resuming"
-                    ) from error
-                if switched:
-                    with exclusive_lock(
-                        Path(cfg["lock_file"]), timeout=options.wait_seconds, identity=identity[1:]
-                    ):
-                        if previous:
-                            atomic_symlink(previous, current)
-                        else:
-                            current.unlink(missing_ok=True)
-                if stopped and timer_active:
-                    command(runner, ["systemctl", "start", options.timer])
-            except BaseException as recovery_error:
-                if activation_attempted and isinstance(recovery_error, DeployError):
-                    raise recovery_error
+            if activation_attempted:
+                # New web callbacks or a timer may already have written business data. Never undo it.
+                stop_managed()
                 raise DeployError(
-                    "Deployment failed; automatic recovery failed, inspect service and timer"
+                    "Activation failed; candidate remains current and services are stopped; inspect before resuming"
+                ) from error
+            try:
+                if database_touched or switched:
+                    with writer_locks():
+                        if database_touched:
+                            if backup:
+                                restore_database(backup, database, identity)
+                            elif not database_existed:
+                                for suffix in ("", "-wal", "-shm", "-journal"):
+                                    Path(str(database) + suffix).unlink(missing_ok=True)
+                        if switched:
+                            if previous:
+                                atomic_symlink(previous, current)
+                            else:
+                                current.unlink(missing_ok=True)
+                if stopped:
+                    if web_active:
+                        command(runner, ["systemctl", "start", options.web_service])
+                    if timer_active:
+                        command(runner, ["systemctl", "start", options.timer])
+            except BaseException as recovery_error:
+                stop_managed()
+                raise DeployError(
+                    "Deployment failed; automatic recovery failed, keep services stopped and inspect"
                 ) from recovery_error
             raise error
 
@@ -381,6 +534,8 @@ def main(argv=None):
     parser.add_argument("--python", type=Path, default=Path("/usr/bin/python3.12"))
     parser.add_argument("--service", default="parser.service")
     parser.add_argument("--timer", default="parser.timer")
+    parser.add_argument("--web-service", default="parser-web.service")
+    parser.add_argument("--health-seconds", type=float, default=30)
     parser.add_argument("--wait-seconds", type=float, default=900)
     options = DeployOptions(**vars(parser.parse_args(argv)))
     if os.geteuid() != 0:

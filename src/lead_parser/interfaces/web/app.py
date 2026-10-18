@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import hmac
 import html
+import json
+import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler
+from importlib.metadata import version
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from lead_parser.infrastructure.persistence.schema import SCHEMA_VERSION
 from lead_parser.infrastructure.persistence.sqlite import Store
 from lead_parser.infrastructure.tracking import looks_like_bot
 
@@ -109,6 +115,8 @@ def make_handler(
         def do_GET(self) -> None:
             parts = urlsplit(self.path)
             query = parse_qs(parts.query)
+            if parts.path == "/healthz":
+                return self._health()
             if parts.path.startswith("/r/"):
                 return self._redirect(parts.path[3:])
             if parts.path != "/" or not panel:
@@ -129,6 +137,27 @@ def make_handler(
             if (query.get("key") or [""])[0]:
                 headers["Set-Cookie"] = f"key={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000"
             self._send(HTTPStatus.OK, page, headers)
+
+        def _health(self) -> None:
+            try:
+                uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+                    if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                        raise ValueError("Database needs migration")
+                    db.execute("SELECT 1 FROM claims LIMIT 1").fetchone()
+                    db.execute("SELECT 1 FROM clicks LIMIT 1").fetchone()
+            except (sqlite3.Error, ValueError):
+                return self._send(HTTPStatus.SERVICE_UNAVAILABLE, '{"status":"unavailable"}')
+            self._send(
+                HTTPStatus.OK,
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "schema_version": SCHEMA_VERSION,
+                        "version": version("remont-lead-parser"),
+                    }
+                ),
+            )
 
         def _redirect(self, link: str) -> None:
             """Personal tracking link: count the click (not link-preview bots) and go to the order."""

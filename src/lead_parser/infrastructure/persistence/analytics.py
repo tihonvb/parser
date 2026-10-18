@@ -25,8 +25,8 @@ def read_snapshot(
     try:
         db.execute("PRAGMA query_only=ON")
         db.execute("BEGIN")
-        if db.execute("PRAGMA user_version").fetchone()[0] != 1:
-            raise ValueError("Unsupported snapshot schema: expected version 1")
+        if db.execute("PRAGMA user_version").fetchone()[0] not in {1, 2}:
+            raise ValueError("Unsupported snapshot schema: expected version 1 or 2")
         bounds = (period.start.timestamp(), period.end.timestamp())
         leads = []
         for row in db.execute(

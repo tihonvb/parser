@@ -140,6 +140,7 @@ DEFAULTS = {
         }
     },
     "web": {
+        "enabled": False,
         "host": "127.0.0.1",
         "port": 8080,
         "token": "",
@@ -357,6 +358,7 @@ def validate_config(cfg: dict, *, require_access: bool = True) -> None:
     web = cfg["web"]
     if (
         not isinstance(web, dict)
+        or type(web.get("enabled")) is not bool
         or not isinstance(web.get("host"), str)
         or type(web.get("port")) is not int
         or not 1 <= web["port"] <= 65535
@@ -484,10 +486,10 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
                 target = target[key]
             target[keys[-1]] = environment[name]
     web_token = cfg["web"]["token"]
-    if cfg["notifications"]["telegram"]["track_clicks"] and (
+    if (cfg["notifications"]["telegram"]["track_clicks"] or web_required(cfg)) and (
         not isinstance(web_token, str) or len(web_token) < 16
     ):
-        raise ConfigError("track_clicks needs web.token (or LEAD_WEB_TOKEN) of 16+ characters")
+        raise ConfigError("Web service needs web.token (or LEAD_WEB_TOKEN) of 16+ characters")
     # several recipients: TELEGRAM_CHAT_IDS="111,222 333" is added to YAML chat_ids / TELEGRAM_CHAT_ID
     extra_ids = [
         item for item in re.split(r"[,\s;]+", str(environment.get("TELEGRAM_CHAT_IDS") or "")) if item
@@ -516,3 +518,9 @@ def load_config(path: Path | str = CONFIG_PATH, *, require_access: bool = True) 
     cfg["_config_path"] = str(path)
     validate_config(cfg, require_access=require_access)
     return cfg
+
+
+def web_required(cfg: dict) -> bool:
+    """Explicit panel or Telegram interactions require a persistent web process."""
+    tg = cfg["notifications"]["telegram"]
+    return cfg["web"]["enabled"] or (tg["enabled"] and (tg["claim_buttons"] or tg["track_clicks"]))

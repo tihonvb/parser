@@ -308,8 +308,11 @@ def test_existing_v1_database_reopens_without_rewriting_payload_or_losing_delive
             "VALUES(72,'vk:-12_9','telegram','operator',71,1)"
         )
         db.execute("INSERT INTO sources VALUES('vk:12',?, '{}',1)", ('{"offset":200}',))
+    from lead_parser.infrastructure.persistence.schema import migrate_database
+
+    migrate_database(path)
     with Store(path) as store:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 2
         assert store.db.execute("SELECT payload FROM leads").fetchone()[0] == payload
         assert store.db.execute("SELECT ai_attempts FROM leads").fetchone()[0] == 2
         assert store.pending_ai() == []

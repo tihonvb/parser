@@ -1,6 +1,6 @@
 [project]
 name = "remont-lead-parser"
-version = "0.2.0.dev0"
+version = "0.2.0"
 description = "Durable VK, Telegram and Avito lead collection"
 requires-python = ">=3.12,<3.15"
 dependencies = [

@@ -2,13 +2,15 @@
 
 import argparse
 import logging
+import signal
 import threading
 import time
 from http.server import ThreadingHTTPServer
 
 import requests
+from filelock import FileLock
 
-from lead_parser.infrastructure.configuration import CONFIG_PATH, load_config
+from lead_parser.infrastructure.configuration import CONFIG_PATH, load_config, web_required
 from lead_parser.infrastructure.integrations.telegram.claims import person_name, poll_once
 from lead_parser.infrastructure.persistence.sqlite import Store
 from lead_parser.interfaces.web.app import make_handler
@@ -21,9 +23,9 @@ def listen(cfg: dict, stop: threading.Event) -> None:
             with Store(cfg["storage"]["database"]) as store:
                 poll_once(cfg, store)
             failures = 0
-        except Exception:
+        except Exception as error:
             failures += 1
-            logging.exception("button listener failed")
+            logging.warning("button listener failed: %s", type(error).__name__)
             stop.wait(min(300, 5 * 2 ** min(failures, 6)))
         time.sleep(0.2)
 
@@ -59,8 +61,13 @@ def click_notifier(cfg: dict):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(CONFIG_PATH))
+    parser.add_argument(
+        "--check-enabled", action="store_true", help="systemd condition: no network or DB writes"
+    )
     args = parser.parse_args(argv)
     cfg = load_config(args.config, require_access=False)
+    if args.check_enabled:
+        return 0 if web_required(cfg) else 1
     web = cfg["web"]
     handler = make_handler(
         cfg["storage"]["database"],
@@ -71,19 +78,33 @@ def main(argv=None):
         on_first_click=click_notifier(cfg),
         name_of=lambda store, chat: person_name(cfg, store, chat),
     )
-    stop = threading.Event()
-    tg = cfg["notifications"]["telegram"]
-    if tg["enabled"] and tg["claim_buttons"]:
-        threading.Thread(target=listen, args=(cfg, stop), daemon=True).start()
-    server = ThreadingHTTPServer((web["host"], web["port"]), handler)
-    logging.basicConfig(level=logging.INFO)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop.set()
-        server.server_close()
+    with FileLock(cfg["storage"]["lock_file"] + ".web", timeout=0):
+        # Ensure a current schema before accepting callbacks; never migrate implicitly.
+        with Store(cfg["storage"]["database"]):
+            pass
+        server = ThreadingHTTPServer((web["host"], web["port"]), handler)
+        stop = threading.Event()
+        listener = None
+        tg = cfg["notifications"]["telegram"]
+        if tg["enabled"] and tg["claim_buttons"]:
+            listener = threading.Thread(target=listen, args=(cfg, stop), daemon=True)
+            listener.start()
+
+        def shutdown(_signum, _frame):
+            stop.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        previous = {sig: signal.signal(sig, shutdown) for sig in (signal.SIGTERM, signal.SIGINT)}
+        logging.basicConfig(level=logging.INFO)
+        try:
+            server.serve_forever()
+        finally:
+            stop.set()
+            server.server_close()
+            if listener:
+                listener.join(timeout=40)
+            for sig, original in previous.items():
+                signal.signal(sig, original)
     return 0
 
 
